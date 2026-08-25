@@ -6,9 +6,11 @@
  */
 import {
   computeDefaultPronyTerms,
+  effectivePronyMax,
   fractionToPercent,
   percentToFraction,
   PERCENT_INPUT_STEP,
+  PRONY_TERMS_MAX,
   PRONY_TERMS_PER_DECADE,
   RELATIVE_ERROR_DEFAULT_PERCENT,
   SMOOTHNESS_DEFAULT_PERCENT,
@@ -68,6 +70,44 @@ describe('computeDefaultPronyTerms', () => {
 
   it('skips non-positive values that log10 cannot use', () => {
     expect(computeDefaultPronyTerms('0\t1e9\n-1\t1e9\n1\t1e9')).toBeNull();
+  });
+});
+
+describe('effectivePronyMax', () => {
+  it('falls back to the static maximum without a usable server cap', () => {
+    // Missing/null before the first response, and anything non-integer or
+    // below 1 is treated as no cap at all.
+    expect(effectivePronyMax(null, 10)).toBe(PRONY_TERMS_MAX);
+    expect(effectivePronyMax(undefined, 10)).toBe(PRONY_TERMS_MAX);
+    expect(effectivePronyMax(NaN, 10)).toBe(PRONY_TERMS_MAX);
+    expect(effectivePronyMax(12.5, 10)).toBe(PRONY_TERMS_MAX);
+    expect(effectivePronyMax(0, 10)).toBe(PRONY_TERMS_MAX);
+    expect(effectivePronyMax(-3, 10)).toBe(PRONY_TERMS_MAX);
+  });
+
+  it('applies a server cap the current value already satisfies', () => {
+    expect(effectivePronyMax(30, 10)).toBe(30);
+  });
+
+  it('never drops the max below the current value (cap-only)', () => {
+    // Lowering an <input type=range> max below its value makes the DOM clamp
+    // the thumb without firing input, desyncing v-model — so above the cap
+    // the user can only move down, and the thumb never jumps.
+    expect(effectivePronyMax(30, 80)).toBe(80);
+  });
+
+  it('clamps an oversized server cap to the static maximum', () => {
+    expect(effectivePronyMax(250, 10)).toBe(PRONY_TERMS_MAX);
+  });
+
+  it('tolerates the degenerate one-term case', () => {
+    expect(effectivePronyMax(1, 1)).toBe(1);
+  });
+
+  it('treats a non-numeric current value as unconstraining', () => {
+    // v-model.number can hand back '' for an emptied input.
+    expect(effectivePronyMax(30, NaN)).toBe(30);
+    expect(effectivePronyMax(30, '' as unknown as number)).toBe(30);
   });
 });
 

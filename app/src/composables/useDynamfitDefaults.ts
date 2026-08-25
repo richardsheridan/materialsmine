@@ -63,6 +63,35 @@ export const PRONY_TERMS_MIN = 5;
 export const PRONY_TERMS_MAX = 100;
 
 /**
+ * Effective maximum for the relaxation-grid-size slider.
+ *
+ * The extract response carries `max_prony`, the eps-rank of the fitted master
+ * curve — the number of Prony terms the data's span and numerical precision
+ * can actually determine; terms past it are numerical null space. Cap-only
+ * semantics: the server's cap may lower the slider's max, but the max never
+ * drops below the CURRENT value. Lowering an `<input type=range>` max below
+ * its value makes the DOM clamp the displayed thumb WITHOUT firing an input
+ * event, silently desyncing v-model from what the user sees (and the store
+ * value the refit watcher reads). So above the cap the user can only move
+ * down; once at or below it, the cap holds. This also makes a stale
+ * `max_prony` (the response object lags one request behind a file swap)
+ * harmless — a stale cap can fail to restrict, never clamp or move the value.
+ *
+ * A missing/null/invalid serverMax (first fit not run yet, temperature
+ * preview) falls back to PRONY_TERMS_MAX.
+ */
+export function effectivePronyMax(
+  serverMax: number | null | undefined,
+  currentValue: number
+): number {
+  if (!Number.isInteger(serverMax) || (serverMax as number) < 1) {
+    return PRONY_TERMS_MAX;
+  }
+  const cap = Math.min(PRONY_TERMS_MAX, serverMax as number);
+  return Math.max(cap, Number.isFinite(currentValue) ? currentValue : 1);
+}
+
+/**
  * Estimate a sensible number of Prony terms from the decade span of the first
  * column of a data file.
  *

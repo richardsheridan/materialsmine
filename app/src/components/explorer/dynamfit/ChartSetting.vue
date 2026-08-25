@@ -326,8 +326,10 @@
           span. The default is about 3 per decade of frequency; a finer grid fits finer
           detail but can overfit noisy data. This is an upper bound rather than the answer:
           the fit discards terms it does not need, and temperature-domain data is capped
-          against the frequency span the ω-T transform produces. The figure legends and the
-          coefficient table report how many terms the fit actually kept.
+          against the frequency span the ω-T transform produces. After a fit, the slider's
+          maximum drops to the number of terms your data's span and precision can determine
+          at all — beyond it the extra terms would be pure numerical noise. The figure
+          legends and the coefficient table report how many terms the fit actually kept.
         </HelpPopover>
       </label>
       <div class="nuplot-range-slider u--margin-centered u_centralize_text viz-u-postion__rel">
@@ -339,12 +341,12 @@
           v-model.lazy.number="dynamfit.range"
           type="range"
           min="1"
-          max="100"
+          :max="cPronyMax"
           :class="[disableInput ? 'nuplot-masked' : '']"
           class="nuplot-range-slider u--layout-width u--margin-centered u_centralize_text viz-u-postion__abs utility-transparentbg"
         />
         <div
-          :style="{ left: `${dynamfit.range}%` }"
+          :style="{ left: `${cPronyTooltipLeft}%` }"
           v-if="showToolTip"
           class="u_margin-top-med viz-u-display__show nuplot-slider-tooltip"
           id="parame-selector-slider-id"
@@ -354,7 +356,7 @@
       </div>
       <div class="u--layout-flex u--layout-flex-justify-sb u--color-grey-sec">
         <div>1</div>
-        <div>100</div>
+        <div>{{ cPronyMax }}</div>
       </div>
     </div>
 
@@ -669,6 +671,7 @@ import { useOptionalChaining } from '@/composables';
 import { useReduce } from '@/composables/useReduce';
 import {
   computeDefaultPronyTerms,
+  effectivePronyMax,
   fractionToPercent,
   percentToFraction,
   ERROR_SCALE_DEFAULT,
@@ -905,6 +908,26 @@ const cHasErrorColumns = computed<boolean>(() => {
     cols.includes('Error') ||
     (cols.includes('E Storage Error') && cols.includes('E Loss Error'))
   );
+});
+
+// The server's eps-rank cap on the grid-size slider, known (like the error
+// columns above) only WITH the fit response, and subject to the same one-
+// request stale window on a file swap. Staleness is harmless here by
+// construction: effectivePronyMax never lets the max drop below the current
+// value, so a stale cap can only fail to restrict — it cannot clamp the
+// thumb or perturb the store value (which the deep refit watcher reads).
+const cServerMaxProny = computed<number | null>(() => {
+  const v = dynamfitData.value?.max_prony;
+  return Number.isInteger(v) && v >= 1 ? v : null;
+});
+const cPronyMax = computed<number>(() =>
+  effectivePronyMax(cServerMaxProny.value, dynamfit.value?.range)
+);
+// Tooltip position as a percent of the track; the old inline `${range}%`
+// assumed the range was always 1..100.
+const cPronyTooltipLeft = computed<number>(() => {
+  const span = cPronyMax.value - 1;
+  return span > 0 ? ((dynamfit.value.range - 1) / span) * 100 : 0;
 });
 
 const updateControls = computed(() => {
