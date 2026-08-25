@@ -9,6 +9,10 @@ user-facing smoothness knob is normalized, and how the equilibrium modulus is
 kept out of the Newton solver's search (`_PlateauProjectedProblem`).
 """
 
+import contextlib
+import ctypes
+import threading
+
 import numpy as np
 from scipy.optimize import minimize, nnls
 
@@ -16,6 +20,99 @@ from .prony import prony_relaxation_space
 from .objective import _PronyLoss, _scaled_smoothness
 from .reduction import _prony_reduce
 from .quality import _FitQuality, _prony_fit_quality
+
+
+# Wall-clock budget for the Newton solve, in seconds. Legitimate solves run
+# on the reduced system — row-count independent, ~25 evaluations — and finish
+# in milliseconds across the whole 324-case benchmark grid, so 3 s is two to
+# three orders of magnitude of headroom, while surfacing a runaway solve as
+# this module's actionable 400 well before the gunicorn worker's 60 s
+# request timeout SIGKILLs it into an opaque 500 (observed 2026-08-25; see
+# _newton_watchdog).
+_NEWTON_TIME_BUDGET = 3.0
+
+
+class SmoothPronyFitTimeout(ValueError):
+    """The Newton solve exceeded _NEWTON_TIME_BUDGET.
+
+    A ValueError so the routes' existing except-ValueError arm turns it into
+    a 400 whose message reaches the user's snackbar verbatim — this is an
+    input-driven condition (the requested grid size, against this data) with
+    a user-side remedy, not a server fault.
+    """
+
+
+class _NewtonBudgetExceeded(BaseException):
+    """Injected into the solver thread by _newton_watchdog.
+
+    BaseException, not Exception, so no library except-Exception handler
+    between the injection point and smooth_prony_fit can swallow it.
+    """
+
+
+@contextlib.contextmanager
+def _newton_watchdog(budget: float):
+    """
+    Raise _NewtonBudgetExceeded in the calling thread if the body runs longer
+    than `budget` seconds.
+
+    Why this exists: scipy's trust-exact subproblem solver
+    (_trustregion_exact.IterativeSubproblem.solve) is a `while True` whose
+    every exit path requires a Moré-Sorensen stop inequality to hold, and at
+    Hessian condition ~1/eps those inequalities can be unsatisfiable in
+    float64 — the lambda iteration then cycles forever (`self.niter` is
+    counted but never checked, so minimize's maxiter cannot help: the outer
+    loop never gets control back). Observed 2026-08-25 on a noise-free
+    synthetic 2-decade file at N within a few terms of the eps-rank: 88
+    subproblems solved in microseconds, the 89th still spinning at 120 s,
+    with the gradient already down 7 decades — the fit was done, the solver
+    just could not certify its last step.
+
+    Upstream knows: scipy gh-12513 ("Halting problem in trust-exact
+    subproblem", open since 2020) was closed by capping that loop at 25
+    passes (subproblem_maxiter, scipy 1.17.0), and scipy 1.18.0 additionally
+    fixed the loop reusing a STALE Cholesky factor after re-factorization
+    (gh-20244) — a correctness bug present in the 1.10.1 this project is
+    pinned to (last release supporting Python 3.8) and a plausible driver of
+    the observed cycling. If the stack ever moves past 3.8, scipy >= 1.17
+    turns a runaway subproblem into a degraded step instead of a hang and
+    this watchdog becomes belt-and-suspenders; it should stay regardless,
+    since the capped subproblem still cannot make N beyond the sqrt(eps)
+    rank meaningful (see reduction.prony_rank_limits).
+
+    Mechanism: a daemon Timer thread calls PyThreadState_SetAsyncExc on this
+    thread's id, which schedules the exception at the next bytecode boundary.
+    That interrupts the pathological loop because it is pure Python (a few
+    small LAPACK calls per pass, each returning promptly); it could NOT
+    interrupt a single long-blocking C call, which is fine here and is why
+    this is not a general-purpose timeout. Chosen over signal.alarm because
+    SIGALRM only works in the main thread — Flask's threaded dev server and
+    any threaded WSGI deployment would silently lose the guard — and over a
+    worker process because the reduced problem is cheap to ship but the memo
+    objects are not.
+
+    Exit protocol: cancel the timer, then clear any injection that is
+    scheduled but not yet delivered (SetAsyncExc with NULL). A delivery that
+    races past the clear — the body finishing at essentially exactly the
+    budget — still unwinds as _NewtonBudgetExceeded through the `with`
+    statement, so the caller's except arm reports a timeout for a fit that
+    technically completed; that is the policy boundary behaving as a
+    boundary, not a leak into unrelated code.
+    """
+    tid = threading.get_ident()
+
+    def _expire():
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(tid), ctypes.py_object(_NewtonBudgetExceeded))
+
+    timer = threading.Timer(budget, _expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
 
 
 class _PlateauProjectedProblem:
@@ -158,6 +255,16 @@ def smooth_prony_fit(
     (an unbounded `while True` in scipy that maxiter cannot cap) while BFGS
     overflowed to NaN. Do not reintroduce it.
 
+    The flat seed does not make that loop unreachable, only rare: with N
+    within a few terms of the data's eps-rank on effectively noise-free data,
+    the near-converged Hessian's condition reaches ~1/eps and the subproblem's
+    stop inequalities become unsatisfiable in float64 (observed 2026-08-25,
+    hung past 120 s with the gradient already down 7 decades). The solve
+    therefore runs under _newton_watchdog, which converts a run past
+    _NEWTON_TIME_BUDGET into SmoothPronyFitTimeout — a ValueError, so the
+    routes answer 400 with the actionable message instead of the gunicorn
+    worker being killed into an opaque 500.
+
     Parameters:
         omega (numpy.ndarray): 1-D array of angular frequencies.
         E_stor (numpy.ndarray): 1-D array of storage-modulus values, same
@@ -269,14 +376,24 @@ def smooth_prony_fit(
     # Flat seed, data-scaled: zero curvature, so the penalty contributes
     # nothing to the first step however large its weight.
     x0 = np.full(N, np.log(E_stor.max() / m))
-    with np.errstate(over='ignore', invalid='ignore'):
-        result = minimize(
-            fun=problem.fun,
-            x0=x0,
-            jac=problem.jac,
-            hess=problem.hess,
-            method='trust-exact',
-        )
+    try:
+        with _newton_watchdog(_NEWTON_TIME_BUDGET), \
+                np.errstate(over='ignore', invalid='ignore'):
+            result = minimize(
+                fun=problem.fun,
+                x0=x0,
+                jac=problem.jac,
+                hess=problem.hess,
+                method='trust-exact',
+            )
+    except _NewtonBudgetExceeded:
+        raise SmoothPronyFitTimeout(
+            f"The fit did not converge within {_NEWTON_TIME_BUDGET:.0f} "
+            f"seconds at a relaxation grid size of {N}. Grid sizes near the "
+            f"limit of what the data's span and precision can determine can "
+            f"trap the solver — lower the relaxation grid size, or raise "
+            f"the smoothness or the assumed error."
+        ) from None
     # result.success is deliberately not consulted: near the optimum the
     # trust radius can collapse on a precision-limited reduction ratio and
     # scipy reports "bad approximation" with the gradient already ~1e-5.

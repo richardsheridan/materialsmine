@@ -326,5 +326,47 @@ class TestFitShiftCoefficientsRoute(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class TestExtractRouteSolverTimeout(unittest.TestCase):
+    """
+    Wiring for the solver's wall-clock guard on POST /tri-ve/extract/.
+
+    fit.SmoothPronyFitTimeout is a ValueError precisely so the route's
+    existing except-ValueError arm answers 400 with the actionable message in
+    the body (the client shows it in a snackbar). The real condition takes the
+    full time budget by definition, so this patches update_line_chart at the
+    route boundary — the guard itself is tested in
+    test_prony.TestNewtonWatchdog.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        Config.SECRET_KEY = 'test-secret'
+        cls.app = make_app()
+        cls.client = cls.app.test_client()
+        cls.token = make_token()
+        cls.headers = {'Authorization': f'Bearer {cls.token}',
+                       'Content-Type': 'application/json'}
+
+    @patch('app.trive.routes.update_line_chart')
+    @patch('app.trive.routes.upload_init',
+           return_value={'Frequency': [1.0], 'E Storage': [1.0],
+                         'E Loss': [1.0]})
+    @patch('app.trive.routes.check_file_exists', return_value=True)
+    def test_solver_timeout_returns_400_with_message(
+            self, _exists, _upload, chart):
+        from app.trive.fit import SmoothPronyFitTimeout
+        chart.side_effect = SmoothPronyFitTimeout(
+            'The fit did not converge within 3 seconds at a relaxation grid '
+            'size of 41. Lower the relaxation grid size.')
+        resp = self.client.post(
+            '/tri-ve/extract/',
+            data=json.dumps({'file_name': 'data.txt', 'number_of_prony': 41,
+                             'smoothness': 0.04}),
+            headers=self.headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('did not converge', json.loads(resp.data)['message'])
+
+
 if __name__ == '__main__':
     unittest.main()

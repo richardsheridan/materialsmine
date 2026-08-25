@@ -160,11 +160,13 @@ def _prony_reduce(
 
 
 # Probe grid size for prony_rank_limits: enough columns that the measured rank
-# is never truncated by the grid right at the PRONY_TERMS_MAX ceiling. The rank
-# density of this basis is ~15 columns/decade at float64 (see the rank law in
-# prony_rank_limits), so the counts that matter — those at or below the route's
-# cap of 100 — are only reachable for spans under ~5.6 decades, where this grid
-# provides >= ~19 columns/decade: denser than the rank it is measuring.
+# is never truncated by the grid right at the PRONY_TERMS_MAX ceiling. The
+# sqrt(eps)-rank density of this basis is ~7.5 columns/decade at float64 (see
+# the rank law in prony_rank_limits), so the counts that matter — those at or
+# below the route's cap of 100 — are only reachable for spans under ~12.5
+# decades, where this grid provides >= ~8.6 columns/decade: denser than the
+# rank it is measuring (and near that crossover any residual grid-truncation
+# errs low, i.e. toward a slightly safer cap).
 _RANK_PROBE_TERMS = PRONY_TERMS_MAX + 8
 
 
@@ -198,18 +200,30 @@ def prony_rank_limits(
 
     Two counts come back, for two different consumers:
 
-      * max_prony — the arithmetic ceiling: singular values above
-        eps * sigma_max, where eps is the machine epsilon OF THE INPUT ARRAYS'
-        dtype (np.result_type of the two modulus arrays). Everything upstream
-        computes in float64 today, but data that arrives as float32 carries
-        only float32 information — modes below its quantization floor would
-        fit rounding noise — so the ceiling follows the data's own precision
-        with no code change if a lower-precision source ever appears. Uniform
-        std_scale moves every sigma together and cancels out of this count;
-        the SHAPE of the std profile does move it, deliberately — the weighted
-        system is the one actually solved. Clipped to
-        [1, PRONY_TERMS_MAX] after dropping the equilibrium column
-        (a determined plateau is not a relaxation term the slider counts).
+      * max_prony — the solver's ceiling: singular values above
+        sqrt(eps) * sigma_max, where eps is the machine epsilon OF THE INPUT
+        ARRAYS' dtype (np.result_type of the two modulus arrays). sqrt, not
+        eps itself, because the smoothed fit is Newton through the Hessian,
+        whose Gauss-Newton part is the basis Gram — the basis condition
+        number arrives SQUARED. A mode with sigma_k between eps and sqrt(eps)
+        of sigma_max is still representable in the basis, but its Hessian
+        eigenvalue sits below eps of the largest: numerically singular, and
+        measurably fatal — at N in that band on effectively noise-free data,
+        scipy's trust-exact subproblem loop was observed to cycle forever
+        (fit._newton_watchdog is the backstop for callers that ignore this
+        cap; hangs began ~60% above it on the file that exposed the problem,
+        every N at or below the cap solving in milliseconds). Everything
+        upstream computes in float64 today, but data that arrives as float32
+        carries only float32 information — modes below its quantization floor
+        would fit rounding noise — so the ceiling follows the data's own
+        precision with no code change if a lower-precision source ever
+        appears. Measured through this probe at float64 the count runs
+        ~7.5 * D + 7.5 over D decades. Uniform std_scale moves every sigma
+        together and cancels out of this count; the SHAPE of the std profile
+        does move it, deliberately — the weighted system is the one actually
+        solved. Clipped to [1, PRONY_TERMS_MAX] after dropping the
+        equilibrium column (a determined plateau is not a relaxation term the
+        slider counts).
 
       * noise_prony — the statistical ceiling under the SELECTED error model:
         _prony_reduce returns the triangle already divided by (std * std_scale),
@@ -254,7 +268,8 @@ def prony_rank_limits(
     )
     sigma = np.linalg.svd(R, compute_uv=False)
     eps = np.finfo(np.result_type(E_stor, E_loss)).eps
-    eps_count = int(np.count_nonzero(sigma > eps * sigma[0]))
+    # sqrt: the Newton solver squares the basis condition (see docstring).
+    eps_count = int(np.count_nonzero(sigma > np.sqrt(eps) * sigma[0]))
     max_prony = int(min(PRONY_TERMS_MAX, max(1, eps_count - solid)))
     noise_prony = int(np.count_nonzero(sigma * np.max(E_stor) > 1.0))
     return max_prony, noise_prony

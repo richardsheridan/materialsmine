@@ -38,7 +38,14 @@ from app.trive.objective import (
 )
 from app.trive.reduction import _prony_reduce, prony_rank_limits
 from app.trive.quality import _prony_fit_quality
-from app.trive.fit import smooth_prony_fit, _PlateauProjectedProblem
+import app.trive.fit as prony_fit
+from app.trive.fit import (
+    smooth_prony_fit,
+    _PlateauProjectedProblem,
+    _newton_watchdog,
+    _NewtonBudgetExceeded,
+    SmoothPronyFitTimeout,
+)
 from app.trive.calibration import argmax_peak
 from app.trive.figures import _build_coef_records
 
@@ -1175,6 +1182,28 @@ class TestPronyRankLimits(unittest.TestCase):
         )
         self.assertLess(low, full)
 
+    def test_cap_counts_sqrt_eps_not_eps(self):
+        # The precision ceiling thresholds singular values at sqrt(eps), not
+        # eps: the Newton solver works through the Hessian, whose Gauss-Newton
+        # part squares the basis condition, so modes between sqrt(eps) and eps
+        # of sigma_max make the Hessian numerically singular — the regime where
+        # scipy's trust-exact subproblem was observed to loop forever (this
+        # very fixture at decades=2, N=35..41). Someone "tightening" sqrt(eps)
+        # back to eps would re-open the slider's path into that regime.
+        omega, E_stor, E_loss, std = self._master(2)
+        max_prony, _ = prony_rank_limits(omega, E_stor, E_loss, std, std,
+                                         solid=True, std_scale=0.01)
+        tau_probe = reduction.prony_relaxation_space(
+            1 / omega.max(), 1 / omega.min(), reduction._RANK_PROBE_TERMS)
+        R, _ = _prony_reduce(omega, E_stor, E_loss, std, std,
+                             tau_probe, True, 0.01)
+        sigma = np.linalg.svd(R, compute_uv=False)
+        eps = np.finfo(np.float64).eps
+        sqrt_count = int(np.count_nonzero(sigma > np.sqrt(eps) * sigma[0]))
+        eps_count = int(np.count_nonzero(sigma > eps * sigma[0]))
+        self.assertEqual(max_prony, sqrt_count - 1)  # - solid
+        self.assertLess(max_prony, eps_count - 1)
+
     def test_tiny_upload_is_row_limited(self):
         # Two frequency points -> four weighted rows: the reduced triangle is
         # short and wide (see _prony_reduce), the SVD still runs, and neither
@@ -1771,6 +1800,71 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         projected = _PlateauProjectedProblem(data, basis, 0.3, log_cap=20.0)
         self.assertEqual(projected.fun(over[1:]), np.inf)
         self.assertTrue(np.all(np.isfinite(projected.jac(over[1:]))))
+
+
+class TestNewtonWatchdog(unittest.TestCase):
+    """
+    The wall-clock guard around the trust-exact solve.
+
+    scipy's subproblem loop can cycle forever at Hessian condition ~1/eps
+    (see fit._newton_watchdog); these tests exercise the guard against a
+    deterministic pure-Python stand-in for that loop rather than the real
+    hang, which is data- and BLAS-dependent and takes the full budget by
+    definition. The stand-ins spin in Python (not time.sleep) because the
+    async injection is only delivered at bytecode boundaries — a blocking C
+    call could not be interrupted, and a test built on one would hang.
+    """
+
+    @staticmethod
+    def _spin(seconds):
+        # Bounded busy-wait: if the watchdog is broken the loop ends and the
+        # caller fails the test, instead of hanging the suite forever.
+        import time
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            pass
+
+    def test_watchdog_interrupts_a_pure_python_loop(self):
+        with self.assertRaises(_NewtonBudgetExceeded):
+            with _newton_watchdog(0.1):
+                self._spin(30.0)
+                self.fail('watchdog never fired')
+
+    def test_watchdog_cancels_cleanly_on_prompt_exit(self):
+        # A body that finishes inside the budget must leave nothing armed and
+        # nothing pending: keep executing Python well past the budget and
+        # reach the end without an injected exception surfacing.
+        import time
+        with _newton_watchdog(0.05):
+            pass
+        time.sleep(0.2)
+        self._spin(0.05)
+
+    def test_hanging_solve_becomes_actionable_timeout(self):
+        # A minimize that never returns must surface as SmoothPronyFitTimeout
+        # naming the requested grid size — the message the user's snackbar
+        # shows — rather than as a worker kill.
+        omega = np.logspace(0, 2, 20)
+        E_stor = 1e3 + 1e6 * omega ** 2 / (1 + omega ** 2)
+        E_loss = 1e6 * omega / (1 + omega ** 2) + 1e2
+        std = np.abs(E_stor + 1.0j * E_loss)
+
+        def hanging_minimize(*args, **kwargs):
+            self._spin(30.0)
+            raise AssertionError('watchdog never fired')
+
+        with mock.patch.object(prony_fit, 'minimize', hanging_minimize), \
+                mock.patch.object(prony_fit, '_NEWTON_TIME_BUDGET', 0.2):
+            with self.assertRaises(SmoothPronyFitTimeout) as caught:
+                smooth_prony_fit(omega, E_stor, E_loss, std, std,
+                                 N=8, smoothness=0.04, std_scale=0.01)
+        self.assertIn('relaxation grid size of 8', str(caught.exception))
+
+    def test_timeout_is_a_value_error_for_the_routes(self):
+        # The routes' except-ValueError arm is what turns this into a 400
+        # with the message intact; losing the subclassing would demote it to
+        # the generic 500 path.
+        self.assertTrue(issubclass(SmoothPronyFitTimeout, ValueError))
 
 
 class TestArgmaxPeak(unittest.TestCase):
