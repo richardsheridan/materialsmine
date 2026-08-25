@@ -53,14 +53,17 @@ def _curve_fit_shift(model, T: np.ndarray, log10_a_T: np.ndarray,
     Raises:
         ValueError: If curve_fit fails to converge.
     """
-    # TODO(scipy>=1.11): fixed parameters are currently held constant by
-    # closure reparametrization (excluded from the fit vector and captured in
-    # `model`) because scipy 1.10.1 rejects equal bounds with "Each lower bound
-    # must be strictly less than each upper bound". Once the services env is
-    # bumped to scipy >= 1.11, this can be revised to pass ALL parameters to
-    # curve_fit with bounds, fixing a parameter via lb == ub. That would let the
-    # callers (fit_wlf_coefficients / fit_hybrid_coefficients) drop their
-    # per-parameter free/fixed branching in favor of one bounds vector.
+    # Fixed parameters are held constant by closure reparametrization
+    # (excluded from the fit vector and captured in `model`) because
+    # curve_fit rejects equal bounds with "Each lower bound must be strictly
+    # less than each upper bound". This is PERMANENT, not a version gap: an
+    # earlier TODO here promised scipy >= 1.11 would allow lb == ub fixing,
+    # but that release's equal-bounds work landed in minimize /
+    # differential_evolution only — least_squares (which curve_fit wraps)
+    # still raises on lb >= ub in every release through current main
+    # (checked v1.11.0, v1.13.0, v1.15.0, main @ 1.18-dev, 2026-08-25). Do
+    # not simplify the callers' per-parameter free/fixed branching on the
+    # strength of a scipy bump.
     if log10_space:
         fit_model = model
     else:

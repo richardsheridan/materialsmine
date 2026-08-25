@@ -50,6 +50,35 @@ class _NewtonBudgetExceeded(BaseException):
     """
 
 
+# TODO(python>=3.12 + scipy>=1.18): retire this machinery, keep the guard.
+# scipy >= 1.17 caps the subproblem loop (subproblem_maxiter, default 25) and
+# the outer trust-region loop was always capped (maxiter defaults to 200*n),
+# so minimize cannot hang there — but "bounded" is not "fast": the worst
+# legal case at N=100 is 20,000 outer x 25 inner passes, tens of seconds,
+# enough for one slider drag through a bad zone to stack up every sync
+# worker. So keep the budget, get it the boring way (verified against scipy
+# main, 2026-08-25 — result.status is 1 exactly when the outer loop stopped
+# on maxiter; status 2, "bad approximation", stays cosmetic and ignored):
+#
+#     result = minimize(..., method='trust-exact',
+#                       options={'maxiter': 500})  # healthy runs: ~25-90
+#     if result.status == 1:
+#         raise SmoothPronyFitTimeout(...)  # same 400; reword the message
+#                                           # from seconds to an iteration
+#                                           # budget
+#
+# then delete _newton_watchdog, _NewtonBudgetExceeded, _NEWTON_TIME_BUDGET
+# and the contextlib/ctypes/threading imports, and replace
+# TestNewtonWatchdog's mechanism tests with a maxiter-exhaustion test (a
+# tiny 'maxiter' against the known-pathological fixture in
+# TestPronyRankLimits.test_cap_counts_sqrt_eps_not_eps). Two things do NOT
+# retire with it: never return the capped result even though it is often
+# near-converged (it would silently break the ~1e-13 reproducibility
+# contract that makes coefficient diffs meaningful), and never drop the
+# sqrt(eps) cap in prony_rank_limits — scipy's caps restore liveness, not
+# determinability. Upstream wart to watch when bumping: the capped
+# subproblem can exit with `p` unbound if every pass fails factorization
+# (UnboundLocalError, scipy main as of 2026-08-25).
 @contextlib.contextmanager
 def _newton_watchdog(budget: float):
     """
