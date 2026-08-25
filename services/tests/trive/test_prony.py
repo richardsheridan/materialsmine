@@ -36,7 +36,7 @@ from app.trive.objective import (
     _prony_objective,
     _scaled_smoothness,
 )
-from app.trive.reduction import _prony_reduce
+from app.trive.reduction import _prony_reduce, prony_rank_limits
 from app.trive.quality import _prony_fit_quality
 from app.trive.fit import smooth_prony_fit, _PlateauProjectedProblem
 from app.trive.calibration import argmax_peak
@@ -1076,6 +1076,119 @@ class TestPronyReduce(unittest.TestCase):
         self.assertAlmostEqual(
             full @ full, reduced @ reduced, delta=1e-8 * (full @ full),
         )
+
+
+class TestPronyRankLimits(unittest.TestCase):
+    """The SVD rank probe: term-count ceilings from precision and noise."""
+
+    def setUp(self):
+        reduction._REDUCE_CACHE.clear()
+
+    @staticmethod
+    def _master(decades, n_per_decade=30):
+        # A single broad transition sampled over the requested span — enough
+        # structure that the weighted basis is a realistic probe target, with
+        # no fixture file to load.
+        omega = np.logspace(0.0, decades, max(60, int(n_per_decade * decades)))
+        E_stor = 1e3 + 1e6 * omega ** 2 / (1 + omega ** 2)
+        E_loss = 1e6 * omega / (1 + omega ** 2) + 1e2
+        std = np.abs(E_stor + 1.0j * E_loss)
+        return omega, E_stor, E_loss, std
+
+    def _limits(self, decades=4, **overrides):
+        omega, E_stor, E_loss, std = self._master(decades)
+        args = dict(omega=omega, E_stor=E_stor, E_loss=E_loss,
+                    E_stor_std=std, E_loss_std=std,
+                    solid=True, std_scale=0.01)
+        args.update(overrides)
+        return prony_rank_limits(**args)
+
+    def test_returns_plain_ints_within_bounds(self):
+        # The route serializes with stdlib json.dumps, which rejects numpy
+        # scalars — the counts must come back as Python ints.
+        max_prony, noise_prony = self._limits()
+        self.assertIs(type(max_prony), int)
+        self.assertIs(type(noise_prony), int)
+        self.assertGreaterEqual(max_prony, 1)
+        self.assertLessEqual(max_prony, PRONY_TERMS_MAX)
+        self.assertGreaterEqual(noise_prony, 0)
+
+    def test_probe_reduction_is_cached_separately_from_the_fit(self):
+        # The probe grid content-addresses to its own LRU entry: a repeat call
+        # after a fit on the same data must run no additional QR, while the
+        # fit's own (different) grid still gets its own reduction.
+        omega, E_stor, E_loss, std = self._master(4)
+        calls = []
+        original = np.linalg.qr
+
+        def counting_qr(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        np.linalg.qr = counting_qr
+        try:
+            first = prony_rank_limits(omega, E_stor, E_loss, std, std)
+            after_probe = len(calls)
+            smooth_prony_fit(omega, E_stor, E_loss, std, std,
+                             N=8, smoothness=0.0)
+            after_fit = len(calls)
+            second = prony_rank_limits(omega, E_stor, E_loss, std, std)
+        finally:
+            np.linalg.qr = original
+        self.assertGreater(after_probe, 0)
+        self.assertGreater(after_fit, after_probe,
+                           msg='fit grid should not collide with the probe')
+        self.assertEqual(len(calls), after_fit, msg='probe cache miss on repeat')
+        self.assertEqual(first, second)
+
+    def test_eps_rank_ignores_std_scale_noise_rank_does_not(self):
+        # A uniform error multiplier moves every singular value together, so
+        # the precision ceiling cannot see it — while the statistical ceiling
+        # exists precisely to see it: more assumed error, fewer determined
+        # modes, down to zero when the stated uncertainty swamps the data.
+        results = [self._limits(std_scale=s) for s in (0.01, 1.0, 100.0)]
+        self.assertEqual(len({max_prony for max_prony, _ in results}), 1)
+        noise = [noise_prony for _, noise_prony in results]
+        self.assertEqual(noise, sorted(noise, reverse=True))
+        self.assertGreater(noise[0], noise[-1])
+        self.assertEqual(self._limits(std_scale=1e9)[1], 0)
+
+    def test_wider_span_supports_more_terms(self):
+        # The rank law: ~0.47 * D * ln(1/eps) per the span D in decades. Both
+        # spans here sit below the PRONY_TERMS_MAX clamp so the comparison is
+        # of the counts themselves, not the clip.
+        narrow, _ = self._limits(decades=2)
+        wide, _ = self._limits(decades=4)
+        self.assertLess(narrow, PRONY_TERMS_MAX)
+        self.assertLess(wide, PRONY_TERMS_MAX)
+        self.assertLess(narrow, wide)
+
+    def test_float32_input_lowers_the_eps_rank(self):
+        # eps comes from the INPUT arrays' dtype: float32 moduli carry only
+        # float32 information, so the ceiling drops — with no code changes
+        # anywhere else — if a lower-precision source ever feeds the route.
+        omega, E_stor, E_loss, std = self._master(4)
+        full, _ = prony_rank_limits(omega, E_stor, E_loss, std, std)
+        low, _ = prony_rank_limits(
+            omega, E_stor.astype(np.float32), E_loss.astype(np.float32),
+            std, std,
+        )
+        self.assertLess(low, full)
+
+    def test_tiny_upload_is_row_limited(self):
+        # Two frequency points -> four weighted rows: the reduced triangle is
+        # short and wide (see _prony_reduce), the SVD still runs, and neither
+        # count can exceed the row count.
+        omega = np.array([1.0, 10.0])
+        E_stor = np.array([2e5, 8e5])
+        E_loss = np.array([1e5, 2e5])
+        std = np.abs(E_stor + 1.0j * E_loss)
+        max_prony, noise_prony = prony_rank_limits(
+            omega, E_stor, E_loss, std, std, std_scale=0.01,
+        )
+        self.assertGreaterEqual(max_prony, 1)
+        self.assertLessEqual(max_prony, 4)
+        self.assertLessEqual(noise_prony, 4)
 
 
 class TestSmoothPronyFit(unittest.TestCase):

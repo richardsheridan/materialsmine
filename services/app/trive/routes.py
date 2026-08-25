@@ -247,6 +247,9 @@ def extract_data_from_file(request_id):
             'shift_chart_placeholder': result[7],
             'shift_table_placeholder': result[8],
         }
+        # Rank ceilings of the fitted master curve; None (-> JSON null) on the
+        # temperature preview path, which the client reads as "no cap".
+        rank_info = result[9] or {}
         
         # Constructing the data dictionary
         data = {
@@ -284,6 +287,14 @@ def extract_data_from_file(request_id):
                 "Tg": Tg,
                 "Ea": Ea,
                 "TC": TC,
+                # int() casts: json.dumps below is stdlib and rejects numpy
+                # scalars (see the a_T_ref echo precedent in the e2e tests).
+                "max_prony": (int(rank_info['max_prony'])
+                              if rank_info.get('max_prony') is not None
+                              else None),
+                "noise_prony": (int(rank_info['noise_prony'])
+                                if rank_info.get('noise_prony') is not None
+                                else None),
                 "warnings": estimate_warnings,
             }
         }

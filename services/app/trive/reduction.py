@@ -14,7 +14,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from .prony import prony_basis
+from .prony import prony_basis, prony_relaxation_space, PRONY_TERMS_MAX
 
 
 # Frequency points per block in smooth_prony_fit's chunked QR reduction. Each
@@ -24,10 +24,12 @@ from .prony import prony_basis
 _QR_CHUNK_ROWS = 8192
 
 # Reduced systems retained by _prony_reduce's LRU cache. Each entry holds only
-# the (m + 1) x (m + 1) triangle — at most ~102 x 102, since the route caps N at
-# 100 — so the cache stays tiny no matter how large the uploads that produced it.
-# Sized for a smoothness sweep, which varies only `smoothness` and can reuse one
-# reduction throughout.
+# the (m + 1) x (m + 1) triangle — at most ~110 x 110, since the route caps N at
+# 100 and the rank probe adds 8 — so the cache stays tiny no matter how large
+# the uploads that produced it. Sized for a smoothness sweep, which varies only
+# `smoothness` and can reuse one reduction throughout. Each dataset now fills
+# TWO slots — the fit's grid and prony_rank_limits' fixed probe grid — so one
+# dataset's sweep still fits with room for a second dataset.
 _REDUCE_CACHE_SIZE = 4
 
 
@@ -155,3 +157,104 @@ def _prony_reduce(
     if len(_REDUCE_CACHE) > _REDUCE_CACHE_SIZE:
         _REDUCE_CACHE.popitem(last=False)
     return reduced[0] / std_scale, reduced[1] / std_scale
+
+
+# Probe grid size for prony_rank_limits: enough columns that the measured rank
+# is never truncated by the grid right at the PRONY_TERMS_MAX ceiling. The rank
+# density of this basis is ~15 columns/decade at float64 (see the rank law in
+# prony_rank_limits), so the counts that matter — those at or below the route's
+# cap of 100 — are only reachable for spans under ~5.6 decades, where this grid
+# provides >= ~19 columns/decade: denser than the rank it is measuring.
+_RANK_PROBE_TERMS = PRONY_TERMS_MAX + 8
+
+
+def prony_rank_limits(
+        omega: np.ndarray,
+        E_stor: np.ndarray,
+        E_loss: np.ndarray,
+        E_stor_std: np.ndarray,
+        E_loss_std: np.ndarray,
+        solid: bool = True,
+        std_scale: float = 1.0,
+) -> tuple:
+    """
+    How many Prony terms this dataset can determine: (max_prony, noise_prony).
+
+    The Prony basis over D decades of frequency has numerical rank
+    ~ 0.47 * D * ln(1/eps) + O(1), INDEPENDENT of the term count: its singular
+    values decay geometrically, sigma_k ~ exp(-pi**2 k / (2 D ln 10)) — the
+    classical inverse-Laplace ill-posedness, halved in rate because the basis
+    stacks two kernel families (storage and loss). Terms beyond that rank span
+    only the numerical null space, so the slider offering them is offering
+    knobs the data cannot turn. Because the rank is a property of the span and
+    the precision, not of the grid, ONE fixed overcomplete probe grid
+    (_RANK_PROBE_TERMS log-spaced tau over the data's own span) measures it
+    for every possible N, and one SVD of the QR-reduced triangle — at most
+    ~110 x 110 whatever the upload size — reads it off. The probe reduction
+    content-addresses to its own _prony_reduce cache entry, distinct from any
+    fit's, so repeated calls on one dataset pay the O(rows) pass once; and
+    since std_scale is excluded from that key, error-widget sweeps redo only
+    the SVD.
+
+    Two counts come back, for two different consumers:
+
+      * max_prony — the arithmetic ceiling: singular values above
+        eps * sigma_max, where eps is the machine epsilon OF THE INPUT ARRAYS'
+        dtype (np.result_type of the two modulus arrays). Everything upstream
+        computes in float64 today, but data that arrives as float32 carries
+        only float32 information — modes below its quantization floor would
+        fit rounding noise — so the ceiling follows the data's own precision
+        with no code change if a lower-precision source ever appears. Uniform
+        std_scale moves every sigma together and cancels out of this count;
+        the SHAPE of the std profile does move it, deliberately — the weighted
+        system is the one actually solved. Clipped to
+        [1, PRONY_TERMS_MAX] after dropping the equilibrium column
+        (a determined plateau is not a relaxation term the slider counts).
+
+      * noise_prony — the statistical ceiling under the SELECTED error model:
+        _prony_reduce returns the triangle already divided by (std * std_scale),
+        so weighted noise has unit variance and singular direction k of the
+        coefficient vector is determined to a standard deviation of 1/sigma_k
+        in modulus units. It counts as data-determined when that uncertainty
+        beats the modulus scale: sigma_k * max(E_stor) > 1. A COUNT of
+        singular directions, not a roster of terms: no particular Prony
+        term is the identifiable one, so downstream wording states a bound
+        ("at most ~k terms are identifiable"), never a partition of the
+        request. A fit asking for more is not wrong, just prior-shaped past
+        that count — the smoothness penalty, not the data, decides the
+        surplus — which is why the caption built from it is worded
+        conditionally on the error profile being accurate. Unclipped
+        and including the equilibrium column (when the data pins the plateau,
+        that is honestly one determined mode; the caption's "~" absorbs the
+        bookkeeping difference).
+
+    Parameters:
+        omega (numpy.ndarray): 1-D array of angular frequencies.
+        E_stor (numpy.ndarray): 1-D array of storage-modulus values.
+        E_loss (numpy.ndarray): 1-D array of loss-modulus values.
+        E_stor_std (numpy.ndarray): 1-D array of per-point standard deviations
+            for E_stor.
+        E_loss_std (numpy.ndarray): 1-D array of per-point standard deviations
+            for E_loss.
+        solid (bool): Whether the probe includes an equilibrium-modulus column,
+            matching the fit the counts will be compared against.
+        std_scale (float): Uniform positive multiplier on both std arrays,
+            exactly as passed to smooth_prony_fit.
+
+    Returns:
+        tuple: (max_prony, noise_prony) as plain Python ints — the route
+        serializes with stdlib json.dumps, which rejects numpy scalars.
+    """
+    tau_probe = prony_relaxation_space(
+        1 / np.max(omega), 1 / np.min(omega), _RANK_PROBE_TERMS
+    )
+    R, _ = _prony_reduce(
+        omega, E_stor, E_loss, E_stor_std, E_loss_std,
+        tau_probe, solid, std_scale,
+    )
+    sigma = np.linalg.svd(R, compute_uv=False)
+    eps = np.finfo(np.result_type(E_stor, E_loss)).eps
+    eps_count = int(np.count_nonzero(sigma > eps * sigma[0]))
+    max_prony = int(min(PRONY_TERMS_MAX, max(1, eps_count - solid)))
+    noise_prony = int(np.count_nonzero(sigma * np.max(E_stor) > 1.0))
+    return max_prony, noise_prony

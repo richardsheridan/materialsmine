@@ -290,8 +290,24 @@ class TestExtractRoute(unittest.TestCase):
                     'relaxation-spectrum-chart', 'complex-temp-chart',
                     'temp-tand-chart', 'shift-chart', 'shift-table',
                     'mytable', 'upload-data',
-                    'C1', 'C2', 'Tg', 'Ea', 'TC', 'warnings'):
+                    'C1', 'C2', 'Tg', 'Ea', 'TC',
+                    'max_prony', 'noise_prony', 'warnings'):
             self.assertIn(key, response)
+
+    def test_rank_fields_are_plain_ints(self):
+        """
+        max_prony / noise_prony must arrive as JSON integers — the route uses
+        stdlib json.dumps, which raises on numpy scalars (same regression
+        class as the a_T_ref echo), so this locks the int() casts end-to-end.
+        """
+        resp = self._post(self._freq_body())
+        self.assertEqual(resp.status_code, 200, resp.data[:400])
+        response = json.loads(resp.data)['response']
+        self.assertIs(type(response['max_prony']), int)
+        self.assertIs(type(response['noise_prony']), int)
+        self.assertGreaterEqual(response['max_prony'], 1)
+        self.assertLessEqual(response['max_prony'], 100)
+        self.assertGreaterEqual(response['noise_prony'], 0)
 
     def test_upload_data_is_array_of_row_objects(self):
         """

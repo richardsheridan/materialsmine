@@ -127,6 +127,45 @@ def _annotate_decimation(figs, percent) -> None:
     ))
 
 
+def _annotate_rank_limit(figs, requested_n, noise_prony) -> None:
+    """
+    Stamp a notice when the requested term count exceeds the noise-limited rank.
+
+    noise_prony is prony_rank_limits' count of SINGULAR DIRECTIONS of the
+    weighted system the SELECTED error profile statistically determines — a
+    count, not a roster: no particular Prony term is the identifiable one,
+    and nothing computes which coefficient combinations clear the threshold.
+    The wording is therefore a bound ("at most ~k terms are identifiable"),
+    never a partition of the requested N into determined and undetermined
+    terms — an earlier "only ~k of N terms are data-determined" draft implied
+    exactly that and was reworded (user feedback, 2026-08-25). "The rest is
+    smoothing" tells the user what fills the surplus degrees of freedom: the
+    prior, collectively — the fit is not wrong, just not data past that
+    point. The wording is deliberately conditional ("if the error profile is
+    accurate...") because the count is only as trustworthy as the error
+    columns or relative-error setting it was computed under — it is a
+    statement about the user's stated uncertainty, not a fact about the data
+    alone. The "~" absorbs the equilibrium-column bookkeeping (noise_prony
+    counts it, the slider does not).
+
+    No-op when noise_prony is None or when the profile supports every
+    requested term — the healthy case adds no visual noise. Stamped after the
+    fit-quality readout and the decimation notice, so it takes the top row:
+    like the decimation notice, it says the same thing on every slider move.
+
+    Parameters:
+        figs: Iterable of plotly Figures to annotate.
+        requested_n (int): The effective Prony term count the fit ran with.
+        noise_prony (int or None): Noise-limited rank, or None to no-op.
+    """
+    if noise_prony is None or noise_prony >= requested_n:
+        return
+    _stamp_notice(figs, (
+        f"if the error profile is accurate, at most ~{noise_prony} terms "
+        f"are identifiable; the rest is smoothing"
+    ))
+
+
 def _annotate_fit_quality(figs, quality) -> None:
     """
     Stamp the fit-quality readout onto each figure that overlays fit on data.

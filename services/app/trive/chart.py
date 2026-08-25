@@ -16,10 +16,12 @@ from app.utils.util import log_errors
 
 from .prony import prony_terms_for_span
 from .fit import smooth_prony_fit
+from .reduction import prony_rank_limits
 from .tts import tts_frequency_to_temperature_V2, tts_temperature_to_frequency_V2
 from .figures import (
     _annotate_decimation,
     _annotate_fit_quality,
+    _annotate_rank_limit,
     _build_coef_records,
     _build_complex_figures,
     _build_relaxation_figures,
@@ -104,6 +106,10 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
             WLF/hybrid model curve. Empty when no transform was requested or
             nothing is drawable (see _build_shift_figure).
         shift_records (list): The table behind fig5; [] when fig5 is empty.
+        rank_info (dict or None): {'max_prony': int, 'noise_prony': int} from
+            prony_rank_limits on the master curve the fit consumed — the
+            data's arithmetic and statistical term-count ceilings. None on the
+            temperature preview path, where no master curve exists to probe.
 
     Raises:
         ValueError: If the uploaded data is empty, contains non-finite values,
@@ -226,6 +232,10 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
                 empty, empty, empty, empty, fig4, fig41,
                 pd.DataFrame(columns=["tau_i", "E_i"]).to_dict("records"),
                 shift_fig, shift_records,
+                # No master curve exists to probe, so no rank_info — a
+                # distinct state from a computed dict, matching the empty
+                # figures above.
+                None,
             )
 
         freq_sweep_data = tts_temperature_to_frequency_V2(
@@ -284,6 +294,19 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
         E_stor_std = np.abs(E_stor_arr + 1.0j * E_loss_arr)
         E_loss_std = E_stor_std
         std_scale = relative_error
+    # Rank ceilings of the master curve the fit is about to consume — probed
+    # here, after any transform, so a temperature upload is measured on the
+    # span the fit actually sees (same reasoning as the span cap above). The
+    # same std arrays and std_scale go in, so the noise count reflects the
+    # error profile the user selected.
+    max_prony, noise_prony = prony_rank_limits(
+        omega=df['Frequency'].to_numpy(),
+        E_stor=E_stor_arr,
+        E_loss=E_loss_arr,
+        E_stor_std=E_stor_std,
+        E_loss_std=E_loss_std,
+        solid=True, std_scale=std_scale,
+    )
     tau_i, E_i, fit_quality = smooth_prony_fit(
         omega=df['Frequency'].to_numpy(),
         E_stor=E_stor_arr,
@@ -312,8 +335,12 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # decimation notice stacks above it. See _stamp_notice.
     _annotate_fit_quality((fig1, fig11), fit_quality)
     _annotate_decimation((fig1, fig11), freq_decimation)
+    # number_of_prony is the EFFECTIVE count here (the temperature branch may
+    # have capped it above), which is what the caption should compare against.
+    _annotate_rank_limit((fig1, fig11), number_of_prony, noise_prony)
     fig2, fig3 = _build_relaxation_figures(tau_i, E_i, N_nz, fit_settings)
     coef_records = _build_coef_records(tau_i, E_i)
 
     return (fig1, fig11, fig2, fig3, fig4, fig41, coef_records,
-            shift_fig, shift_records)
+            shift_fig, shift_records,
+            {'max_prony': max_prony, 'noise_prony': noise_prony})

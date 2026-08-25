@@ -54,8 +54,12 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
             domain='frequency',
         )
 
-    def test_returns_9_tuple(self):
-        self.assertEqual(len(self.result), 9)
+    def test_returns_10_tuple(self):
+        self.assertEqual(len(self.result), 10)
+        # Element 9 is the rank_info dict (see update_line_chart's Returns).
+        self.assertEqual(
+            set(self.result[9]), {'max_prony', 'noise_prony'}
+        )
 
     def test_coef_df_schema(self):
         coef_df = self.result[6]
@@ -203,7 +207,7 @@ class TestUpdateLineChartFrequencyShift(unittest.TestCase):
     def test_frequency_manual_uses_shiftData(self):
         manual = self._run(shift_model='manual', shiftData=self.shiftData)
         wlf = self._run(shift_model='WLF', Tg=30.0, C1=17.44, C2=51.6)
-        self.assertEqual(len(manual), 9)
+        self.assertEqual(len(manual), 10)
         # The manual mapping reached fig4: its temperature axis differs from a
         # WLF evaluation (a different shape alone already proves it, since
         # np.interp clamps).
@@ -334,14 +338,14 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
 
     def test_no_transform_yields_empty_figure_and_table(self):
         # Temperature early-exit (no shift params) — nothing to draw.
-        *_, shift_fig, shift_records = self._run()
+        *_, shift_fig, shift_records, _rank = self._run()
         self.assertEqual(len(shift_fig.data), 0)
         self.assertEqual(shift_records, [])
 
     def test_frequency_none_yields_empty_figure_and_table(self):
         freq_data = upload_init(
             'agilus30 (8) master curve 20C.txt', 'frequency')
-        *_, shift_fig, shift_records = update_line_chart(
+        *_, shift_fig, shift_records, _rank = update_line_chart(
             freq_data, number_of_prony=8, smoothness=0.1,
             fit_settings=True, domain='frequency', shift_model='none',
         )
@@ -350,7 +354,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
 
     def test_manual_draws_markers_only(self):
         # 'manual' has no model curve of its own — Experiment markers only.
-        *_, shift_fig, shift_records = self._run(
+        *_, shift_fig, shift_records, _rank = self._run(
             shift_model='manual', shiftData=self.shiftData)
         self.assertEqual([t.name for t in shift_fig.data], ['Experiment'])
         self.assertEqual(self._trace(shift_fig, 'Experiment').mode, 'markers')
@@ -361,7 +365,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
                          float(self.shiftData['a_T'][0]))
 
     def test_wlf_with_shift_file_draws_markers_and_dashed_curve(self):
-        *_, shift_fig, shift_records = self._run(
+        *_, shift_fig, shift_records, _rank = self._run(
             shift_model='WLF', Tg=self.T_REF, C1=self.C1, C2=self.C2,
             shiftData=self.shiftData)
         self.assertEqual({t.name for t in shift_fig.data},
@@ -385,7 +389,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
                 self.assertIsNone(g)
 
     def test_model_only_wlf_draws_curve_over_data_range(self):
-        *_, shift_fig, shift_records = self._run(
+        *_, shift_fig, shift_records, _rank = self._run(
             shift_model='WLF', Tg=self.T_REF, C1=self.C1, C2=self.C2)
         self.assertEqual([t.name for t in shift_fig.data], ['WLF fit'])
         curve = self._trace(shift_fig, 'WLF fit')
@@ -406,8 +410,8 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
         # without it a fit against a table referenced away from Tg draws a
         # curve parallel to — and decades off — its own Experiment markers.
         kwargs = dict(shift_model='WLF', Tg=self.T_REF, C1=self.C1, C2=self.C2)
-        *_, fig_unit, _ = self._run(**kwargs)
-        *_, fig_shifted, _ = self._run(a_T_ref=100.0, **kwargs)
+        *_, fig_unit, _, _rank = self._run(**kwargs)
+        *_, fig_shifted, _, _rank = self._run(a_T_ref=100.0, **kwargs)
         unit = self._trace(fig_unit, 'WLF fit')
         shifted = self._trace(fig_shifted, 'WLF fit')
         # Compare at shared temperatures, not by position: the offset moves
@@ -423,8 +427,8 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
     def test_hybrid_curve_honors_a_T_ref_offset(self):
         kwargs = dict(shift_model='hybrid', TC=40.0, C1=self.C1, C2=self.C2,
                       Ea=150.0)
-        *_, fig_unit, _ = self._run(**kwargs)
-        *_, fig_shifted, _ = self._run(a_T_ref=100.0, **kwargs)
+        *_, fig_unit, _, _rank = self._run(**kwargs)
+        *_, fig_shifted, _, _rank = self._run(a_T_ref=100.0, **kwargs)
         y_unit = np.array(self._trace(fig_unit, 'hybrid fit').y)
         y_shifted = np.array(self._trace(fig_shifted, 'hybrid fit').y)
         # Same grid, curve multiplied by the offset (where both are drawn).
@@ -451,7 +455,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
         # When both are present the applied table is the honest marker source.
         ref = {'Temperature': np.array([10.0, 20.0]),
                'a_T': np.array([123.0, 1.0])}
-        *_, shift_fig, shift_records = self._run(
+        *_, shift_fig, shift_records, _rank = self._run(
             shift_model='manual', shiftData=self.shiftData,
             shift_reference=ref)
         self.assertEqual(len(shift_records), len(self.shiftData['a_T']))
@@ -461,7 +465,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
         # The transform itself would raise; the figure must instead draw the
         # valid window and skip the rest — so use a shift file to carry the
         # transform and hand the curve bad parameters.
-        *_, shift_fig, _ = self._run(
+        *_, shift_fig, _, _rank = self._run(
             shift_model='WLF', Tg=self.T_REF, C1=self.C1, C2=10.0,
             shiftData=self.shiftData)
         curve = self._trace(shift_fig, 'WLF fit')
@@ -477,15 +481,15 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
             return [a.text for a in (fig.layout.annotations or ())
                     if getattr(a, 'name', '') == 'figure-notice']
 
-        *_, without, _ = self._run(**kwargs)
+        *_, without, _, _rank = self._run(**kwargs)
         self.assertEqual(notices(without), [])
-        *_, with_stamp, _ = self._run(shift_chi2_reduced=0.123, **kwargs)
+        *_, with_stamp, _, _rank = self._run(shift_chi2_reduced=0.123, **kwargs)
         self.assertEqual(notices(with_stamp),
                          ['misfit (χ²/ν) = 0.123 | lower is better'])
 
     def test_figure_and_table_survive_json_round_trip(self):
         import json as _json
-        *_, shift_fig, shift_records = self._run(
+        *_, shift_fig, shift_records, _rank = self._run(
             shift_model='WLF', Tg=self.T_REF, C1=self.C1, C2=self.C2,
             shiftData=self.shiftData, shift_chi2_reduced=0.5)
         blob = _json.dumps({'shift-chart': _json.loads(shift_fig.to_json()),
@@ -520,13 +524,16 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
 
     def test_early_exit_with_no_shift_params(self):
         (fig1, fig11, fig2, fig3, fig4, fig41, coef_df,
-         shift_fig, shift_records) = update_line_chart(
+         shift_fig, shift_records, rank_info) = update_line_chart(
             self.real_temp_data, number_of_prony=10, smoothness=0.1,
             fit_settings=True, domain='temperature',
         )
         for empty in (fig1, fig11, fig2, fig3):
             self.assertEqual(len(empty.data), 0)
         self.assertEqual(coef_df, [])
+        # No master curve was built, so there is nothing to rank-probe:
+        # None, not a dict of Nones.
+        self.assertIsNone(rank_info)
         self.assertGreater(len(fig4.data), 0)
         self.assertGreater(len(fig41.data), 0)
         # Same unshared-tan-delta axis as the frequency figure: outside edge,
@@ -543,7 +550,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             fit_settings=True, domain='temperature',
             Tg=self.T_REF, C1=self.C1, C2=self.C2, shift_model='WLF',
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertIsInstance(coef_df, list)
@@ -556,7 +563,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             Tg=self.T_REF, TC=self.T_REF, C1=self.C1, C2=self.C2,
             Ea=self.EA, shift_model='hybrid',
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertGreater(len(coef_df), 0)
@@ -576,7 +583,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             TC=self.T_REF, C1=self.C1, C2=self.C2,
             Ea=self.EA, shift_model='hybrid',
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertGreater(len(coef_df), 0)
@@ -591,7 +598,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             TC=self.T_REF, C1=self.C1, C2=self.C2, Ea=self.EA,
             shift_model='hybrid',
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertGreater(len(coef_df), 0)
@@ -604,7 +611,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             fit_settings=True, domain='temperature',
             Tg=0.0, C1=self.C1, C2=self.C2, shift_model='WLF',
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertGreater(len(coef_df), 0)
@@ -621,7 +628,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
             fit_settings=True, domain='temperature',
             shiftData=shiftData,
         )
-        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _ = result
+        fig1, fig11, fig2, fig3, fig4, fig41, coef_df, _, _, _ = result
         for fig in (fig1, fig11, fig2, fig3, fig4, fig41):
             self.assertGreater(len(fig.data), 0)
         self.assertGreater(len(coef_df), 0)
@@ -665,14 +672,14 @@ class TestUpdateLineChartTermLabels(unittest.TestCase):
         # exactly zero, which made the old count_nonzero over the whole vector
         # report the grid size plus the equilibrium term — 24 terms for a
         # 23-point grid whose table listed 23 rows.
-        fig1, fig11, fig2, fig3, _, _, coef_df, _, _ = self._run(23, 0.04)
+        fig1, fig11, fig2, fig3, _, _, coef_df, _, _, _ = self._run(23, 0.04)
         self.assertEqual(len(coef_df), 23)
         self.assertEqual(self._label_counts((fig1, fig11, fig2, fig3)), {23})
 
     def test_unsmoothed_labels_match_the_coefficient_table(self):
         # NNLS zeroes coefficients outright, so here the count is genuinely
         # below the grid size — and still must not pick up the equilibrium term.
-        fig1, fig11, fig2, fig3, _, _, coef_df, _, _ = self._run(23, 0.0)
+        fig1, fig11, fig2, fig3, _, _, coef_df, _, _, _ = self._run(23, 0.0)
         self.assertLess(len(coef_df), 23)
         self.assertEqual(self._label_counts((fig1, fig11, fig2, fig3)),
                          {len(coef_df)})
@@ -860,7 +867,7 @@ class TestUpdateLineChartValidation(unittest.TestCase):
         ok = self._freq([1.0, 2.0, 3.0], [100.0, 200.0, 300.0], [10.0, 20.0, 30.0])
         ok['E Storage Error'] = np.asarray([5.0, 10.0, 15.0], float)
         ok['E Loss Error'] = np.asarray([0.5, 1.0, 1.5], float)
-        self.assertEqual(len(self._call(ok, domain='frequency')), 9)
+        self.assertEqual(len(self._call(ok, domain='frequency')), 10)
 
     def test_temperature_domain_zero_error_raises_value_error(self):
         # WLF params chosen as in TestUpdateLineChartErrorColumns so every row
@@ -1127,7 +1134,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
         )
 
     def test_large_upload_experiment_traces_are_thinned(self):
-        fig1, fig11, _, _, fig4, fig41, _, _, _ = self.result
+        fig1, fig11, _, _, fig4, fig41, _, _, _, _ = self.result
         for fig in (fig1, fig11, fig4, fig41):
             lengths = self._experiment_lengths(fig)
             self.assertTrue(lengths)  # experiment traces exist
@@ -1143,7 +1150,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
         self.assertEqual(model_lengths, [1000, 1000])
 
     def test_figures_carry_decimation_notice_with_percentage(self):
-        fig1, fig11, _, _, fig4, fig41, _, _, _ = self.result
+        fig1, fig11, _, _, fig4, fig41, _, _, _, _ = self.result
         expected_pct = int(round(100.0 * (1 - _PLOT_MAX_POINTS / self.N_LARGE)))
         for fig in (fig1, fig11, fig4, fig41):
             notices = self._decimation_notices(fig)
@@ -1154,7 +1161,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
     def test_complex_figures_carry_fit_quality_readout(self):
         # The two figures that overlay the fit on the data get the scores; the
         # temperature-domain visualizations, which show no fit, do not.
-        fig1, fig11, _, _, fig4, fig41, _, _, _ = self.result
+        fig1, fig11, _, _, fig4, fig41, _, _, _, _ = self.result
         for fig in (fig1, fig11):
             readouts = self._quality_readouts(fig)
             self.assertEqual(len(readouts), 1)
@@ -1280,7 +1287,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
             fit_settings=False, domain='frequency',
             shift_model='WLF', Tg=30.0, C1=17.44, C2=51.6,
         )
-        fig1, _, _, _, fig4, _, _, _, _ = result
+        fig1, _, _, _, fig4, _, _, _, _, _ = result
         self.assertTrue(all(n == 200 for n in self._experiment_lengths(fig1)))
         for fig in (fig1, fig4):
             self.assertEqual(self._decimation_notices(fig), [])
@@ -1294,7 +1301,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
             'E Storage': np.linspace(1e9, 1e6, n),
             'E Loss': np.full(n, 1e5),
         }
-        _, _, _, _, fig4, fig41, _, _, _ = update_line_chart(
+        _, _, _, _, fig4, fig41, _, _, _, _ = update_line_chart(
             data, number_of_prony=5, smoothness=0.0,
             fit_settings=False, domain='temperature',
         )
@@ -1303,6 +1310,121 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
             self.assertTrue(lengths)
             self.assertTrue(all(n_ <= _PLOT_MAX_POINTS for n_ in lengths))
             self.assertEqual(len(self._decimation_notices(fig)), 1)
+
+
+class TestUpdateLineChartRankInfo(unittest.TestCase):
+    """The rank_info element and the noise-rank caption it drives."""
+
+    @staticmethod
+    def _frequency_upload(n_rows=300):
+        tau = np.logspace(-3.0, 3.0, 7)
+        E_input = np.concatenate(
+            ([1e6], np.exp(-(np.log10(tau)) ** 2 / 4.0) * 1e9))
+        df = compute_complex(tau, E_input, num_pts=n_rows)
+        return {
+            'Frequency': df['Frequency'].to_numpy(),
+            'E Storage': df['E Storage'].to_numpy(),
+            'E Loss': df['E Loss'].to_numpy(),
+        }
+
+    @staticmethod
+    def _rank_notices(fig):
+        return [a.text for a in fig.layout.annotations
+                if a.text and 'identifiable' in a.text]
+
+    def _run(self, **overrides):
+        args = dict(
+            uploadData=self._frequency_upload(),
+            number_of_prony=10, smoothness=0.0,
+            fit_settings=False, domain='frequency',
+        )
+        args.update(overrides)
+        return update_line_chart(**args)
+
+    def test_frequency_result_carries_rank_info(self):
+        rank_info = self._run()[9]
+        self.assertEqual(set(rank_info), {'max_prony', 'noise_prony'})
+        # Plain ints (the route serializes with stdlib json.dumps), in range.
+        self.assertIs(type(rank_info['max_prony']), int)
+        self.assertIs(type(rank_info['noise_prony']), int)
+        self.assertGreaterEqual(rank_info['max_prony'], 1)
+        self.assertLessEqual(rank_info['max_prony'], 100)
+        self.assertGreaterEqual(rank_info['noise_prony'], 0)
+
+    def test_temperature_result_carries_rank_info(self):
+        # With usable shift params the transform runs and the probe measures
+        # the TRANSFORMED master curve — same shape of result as frequency.
+        # T span clear of the WLF C2 singularity at Tg - C2, as in
+        # TestUpdateLineChartTemperature.
+        T = np.linspace(0.0, 80.0, 30)
+        rank_info = update_line_chart(
+            {
+                'Temperature': T,
+                'E Storage': np.linspace(1000.0, 10.0, len(T)),
+                'E Loss': np.full(len(T), 50.0),
+            },
+            number_of_prony=8, smoothness=0.1,
+            fit_settings=False, domain='temperature',
+            Tg=25.0, C1=17.44, C2=51.6, shift_model='WLF',
+        )[9]
+        self.assertEqual(set(rank_info), {'max_prony', 'noise_prony'})
+        self.assertGreaterEqual(rank_info['max_prony'], 1)
+
+    def test_caption_when_terms_exceed_noise_rank(self):
+        # An enormous stated relative error leaves almost nothing
+        # identifiable, so a full-size request must be called out — on both
+        # figures that overlay the fit, with the count bound embedded. The
+        # wording is a BOUND ("at most ~k"), never a partition of the
+        # requested N: noise_prony counts singular directions, and no
+        # particular term is the identifiable one.
+        result = self._run(number_of_prony=100, relative_error=1000.0)
+        noise_prony = result[9]['noise_prony']
+        self.assertLess(noise_prony, 100)
+        for fig in (result[0], result[1]):
+            notices = self._rank_notices(fig)
+            self.assertEqual(len(notices), 1)
+            self.assertIn('if the error profile is accurate', notices[0])
+            self.assertIn(f'at most ~{noise_prony} terms', notices[0])
+            self.assertNotIn('of 100', notices[0])
+
+    def test_caption_wording_stays_out_of_the_other_filters(self):
+        # The decimation and quality test helpers select notices by substring;
+        # the rank caption must never match either filter.
+        result = self._run(number_of_prony=100, relative_error=1000.0)
+        notice = self._rank_notices(result[0])[0]
+        self.assertNotIn('decimated by', notice)
+        self.assertNotIn('lower is better', notice)
+
+    def test_no_caption_when_error_profile_supports_the_request(self):
+        # A tight error profile determines more modes than the request — the
+        # healthy case adds no visual noise.
+        result = self._run(number_of_prony=5, relative_error=0.001)
+        self.assertGreaterEqual(result[9]['noise_prony'], 5)
+        for fig in (result[0], result[1]):
+            self.assertEqual(self._rank_notices(fig), [])
+
+    def test_rank_caption_stacks_a_third_row_with_headroom(self):
+        # Decimation notice + quality readout + rank caption is the first
+        # three-row stack; the top margin must keep growing so the new top
+        # row is not clipped (see _stamp_notice).
+        big = self._frequency_upload(_PLOT_MAX_POINTS + 500)
+        kwargs = dict(
+            uploadData=big, number_of_prony=10, smoothness=1.0,
+            fit_settings=False, domain='frequency',
+        )
+        two_rows = update_line_chart(relative_error=0.2, **kwargs)[0]
+        three_rows = update_line_chart(relative_error=1000.0, **kwargs)[0]
+        self.assertEqual(len(self._rank_notices(two_rows)), 0)
+        self.assertEqual(len(self._rank_notices(three_rows)), 1)
+        self.assertGreater(three_rows.layout.margin.t,
+                           two_rows.layout.margin.t)
+        # Same-thing-every-move notices stack above the readout being watched:
+        # the rank caption takes the top row.
+        stamped = [a for a in three_rows.layout.annotations
+                   if a.name == 'figure-notice']
+        self.assertEqual(len(stamped), 3)
+        top = max(stamped, key=lambda a: a.y)
+        self.assertIn('identifiable', top.text)
 
 
 if __name__ == '__main__':
