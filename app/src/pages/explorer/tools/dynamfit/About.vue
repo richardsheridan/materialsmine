@@ -61,13 +61,16 @@
         <p>
           When smoothing is on, the fitted curves carry shaded ±1σ bands (and the spectrum dots
           carry error bars) derived from the curvature of the fit's objective at its optimum.
-          Read them as credible intervals <em>given</em> the error inputs and the smoothness
-          setting: they say how well those settings pin down the fit, not how far the fit may sit
-          from the truth. Smoothing bias is not included, so at strong smoothing the true curve
-          can fall outside the band more often than the label suggests. The relaxation-time grid
-          also extends a couple of decades past your data on the smoothed path; there the bands
-          widen sharply because only the smoothness prior — not your data — constrains the
-          extrapolation.
+          The band in the fit line's color is a <em>credible</em> interval on the curve itself —
+          how well the error inputs and the smoothness setting pin down the fit, not how far it
+          may sit from the truth. On the frequency-domain plots, where the moduli are what the
+          instrument actually measures, a second, wider band in the data trace's color is a
+          <em>prediction</em> interval: where a new measurement would land, combining the
+          curve's uncertainty with your stated measurement noise. Smoothing bias is not included
+          in either, so at strong smoothing the true curve can fall outside the credible band
+          more often than the label suggests. The relaxation-time grid also extends a decade
+          past your data on the smoothed path; there the bands widen sharply because only the
+          smoothness prior — not your data — constrains the extrapolation.
         </p>
         <p>
           Time–temperature superposition (TTSP) provides the temperature axis. Tri-VE supports
