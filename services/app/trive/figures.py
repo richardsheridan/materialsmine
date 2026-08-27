@@ -21,6 +21,7 @@ from .uncertainty import (
     _split_terms,
     sigma_log_coefficients,
     spectrum_error_bars,
+    complex_modulus_noise,
     complex_modulus_sigma,
     relaxation_sigma,
 )
@@ -212,10 +213,16 @@ def _annotate_fit_quality(figs, quality) -> None:
 # readable through a band drawn UNDER it (see _prepend_traces).
 _BAND_ALPHA = 0.25
 
-# Legend name shared by every band trace on a figure. One trace per figure
-# shows it (see _band_pair's showlegend), and the shared legendgroup makes
-# that single entry toggle every ribbon at once.
-_BAND_LEGEND = '±1σ'
+# Legend names for the two ribbon kinds. Each doubles as the legendgroup, so
+# one legend entry toggles every ribbon of its kind at once while the two
+# kinds toggle independently. Color follows the trace each band describes:
+# the credible band (where the underlying curve lies) takes the Prony line's
+# color, the prediction band (where a NEW measurement would land — credible
+# variance plus measurement noise) takes the Experiment trace's, both at
+# _BAND_ALPHA. Draw order is prediction, credible, data, fit — the prediction
+# band is the wider by construction, so each layer stays visible.
+_CRED_LEGEND = '±1σ credible'
+_PRED_LEGEND = '±1σ prediction'
 
 
 def _rgba(color: str, alpha: float) -> str:
@@ -235,17 +242,30 @@ def _rgba(color: str, alpha: float) -> str:
     return color
 
 
-def _prony_line_color(fig) -> str:
-    """The line color px gave the Prony overlay trace on this figure.
-
-    Read off the BUILT figure rather than hardcoded, so the bands keep
-    matching if the colorway or trace order ever changes. Falls back to px's
-    second default color (the overlay's usual slot alongside 'Experiment').
-    """
+def _trace_line_color(fig, name_fragment: str, fallback: str) -> str:
+    """The line color px gave the first trace whose name contains the
+    fragment — read off the BUILT figure rather than hardcoded, so the bands
+    keep matching if the colorway or trace order ever changes."""
     for t in fig.data:
-        if 'Term Prony' in (t.name or '') and getattr(t.line, 'color', None):
+        if name_fragment in (t.name or '') and getattr(t.line, 'color', None):
             return t.line.color
-    return '#EF553B'
+    return fallback
+
+
+def _prony_line_color(fig) -> str:
+    """The Prony overlay's line color; the credible band's base color.
+
+    The fallback is px's second default slot, the overlay's usual position
+    alongside 'Experiment' — but on single-color figures (fig2) px hands the
+    overlay slot 0, and reading the built trace keeps the band matching."""
+    return _trace_line_color(fig, 'Term Prony', '#EF553B')
+
+
+def _experiment_line_color(fig) -> str:
+    """The Experiment trace's line color; the prediction band's base color —
+    the band describes where new DATA would land, so it wears the data's
+    color. Fallback is px's first default slot."""
+    return _trace_line_color(fig, 'Experiment', '#636EFA')
 
 
 def _prepend_traces(fig, traces) -> None:
@@ -268,7 +288,7 @@ def _prepend_traces(fig, traces) -> None:
 
 def _band_pair(x, y, sigma, fillcolor: str, log_y: bool,
                xaxis: str = None, yaxis: str = None,
-               showlegend: bool = False) -> tuple:
+               showlegend: bool = False, name: str = _CRED_LEGEND) -> tuple:
     """
     The (lower, upper) go.Scatter pair of a ±1σ ribbon around curve y.
 
@@ -281,10 +301,10 @@ def _band_pair(x, y, sigma, fillcolor: str, log_y: bool,
     where the band is tight. Linear panels use the plain max(y - σ, 0).
 
     Both traces are invisible lines (the fill is the band), skip hover so they
-    don't shadow the curves, and share _BAND_LEGEND's legendgroup; exactly one
-    trace per FIGURE should pass showlegend=True. On faceted figures pass the
-    facet's axis pair ('x'/'y' for column 1, 'x2'/'y2' for column 2)
-    explicitly.
+    don't shadow the curves, and share `name` as their legendgroup; exactly
+    one trace per FIGURE per band kind should pass showlegend=True. On
+    faceted figures pass the facet's axis pair ('x'/'y' for column 1,
+    'x2'/'y2' for column 2) explicitly.
 
     Returns:
         tuple: (lower, upper) traces — keep them adjacent, lower first, since
@@ -297,7 +317,7 @@ def _band_pair(x, y, sigma, fillcolor: str, log_y: bool,
     lower = y * y / (y + capped) if log_y else np.maximum(y - sigma, 0.0)
     common = dict(
         mode='lines', line=dict(width=0),
-        name=_BAND_LEGEND, legendgroup=_BAND_LEGEND,
+        name=name, legendgroup=name,
         hoverinfo='skip', showlegend=False,
     )
     if xaxis is not None:
@@ -392,7 +412,8 @@ def _build_temperature_figures(temp_sweep_data: pd.DataFrame) -> tuple:
 
 
 def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
-                           N_nz: int, covariance: np.ndarray = None) -> tuple:
+                           N_nz: int, covariance: np.ndarray = None,
+                           noise: tuple = None) -> tuple:
     """
     Build E vs frequency and tan-delta vs frequency figures with Prony overlay.
 
@@ -406,14 +427,24 @@ def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
             count of the coefficient table _build_coef_records returns.
         covariance (numpy.ndarray): Posterior covariance of the fitted
             log-coefficients (quality.covariance), or None for no ±1σ
-            ribbons. Bands are evaluated on the SAME frequency grid as the
-            overlay curve — compute_complex's own column — so they cannot
+            ribbons at all. Bands are evaluated on the SAME frequency grid as
+            the overlay curve — compute_complex's own column — so they cannot
             drift onto a different grid.
+        noise (tuple): (omega_data, rel_stor, rel_loss) — the measured
+            frequencies and the RELATIVE noise profile sigma / |E*| the fit
+            ran with (std_scale applied) — or None to skip the prediction
+            ribbons. These figures are the only ones that get a prediction
+            band: the frequency-domain moduli are what the instrument
+            actually measures, so "where would a new reading land" is a real
+            question here, where E(t) and the spectrum are interconversions
+            with no direct observation to predict.
 
     Returns:
         tuple: (fig1, fig11) where fig1 is E' / E'' vs Frequency and fig11 is
-        E' / tan-delta vs Frequency, each with ±1σ ribbons under the curves
-        when covariance is given.
+        E' / tan-delta vs Frequency. With a covariance each carries ±1σ
+        credible ribbons under the curves; with noise as well, wider ±1σ
+        prediction ribbons under those (credible + measurement noise in
+        quadrature). Draw order is prediction, credible, data, fit.
     """
     complex_df = compute_complex(tau_i, E_i)
     x_col, y_col, z_col = df.columns[0], df.columns[1], df.columns[2]
@@ -468,24 +499,44 @@ def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
     if covariance is not None:
         freq = complex_df[cx_x].to_numpy()
         sig = complex_modulus_sigma(freq, tau_i, E_i, covariance)
+        pred = None
+        if noise is not None:
+            omega_data, rel_stor, rel_loss = noise
+            data_sig = complex_modulus_noise(
+                freq, tau_i, E_i, omega_data, rel_stor, rel_loss)
+            # Prediction = credible + measurement noise, in quadrature.
+            pred = {key: np.hypot(sig[key], data_sig[key]) for key in sig}
         stor = complex_df[cx_y].to_numpy()
         loss = complex_df[cx_z].to_numpy()
-        fill = _rgba(_prony_line_color(fig1), _BAND_ALPHA)
         # Facet columns by data order of the melt: col 1 = E Storage on
         # ('x','y'), col 2 = E Loss (fig1) / tan delta (fig11) on ('x2','y2').
-        _prepend_traces(fig1, (
-            *_band_pair(freq, stor, sig['E Storage'], fill, log_y=True,
-                        xaxis='x', yaxis='y', showlegend=True),
-            *_band_pair(freq, loss, sig['E Loss'], fill, log_y=True,
-                        xaxis='x2', yaxis='y2'),
-        ))
-        fill11 = _rgba(_prony_line_color(fig11), _BAND_ALPHA)
-        _prepend_traces(fig11, (
-            *_band_pair(freq, stor, sig['E Storage'], fill11, log_y=True,
-                        xaxis='x', yaxis='y', showlegend=True),
-            *_band_pair(freq, loss / stor, sig['tan delta'], fill11,
-                        log_y=False, xaxis='x2', yaxis='y2'),
-        ))
+        # Prepend order = draw order: the (wider) prediction ribbons paint
+        # first, the credible ribbons over them, then the px traces.
+        for fig, col2_key, y_col2, col2_log in (
+            (fig1, 'E Loss', loss, True),
+            (fig11, 'tan delta', loss / stor, False),
+        ):
+            bands = []
+            if pred is not None:
+                fill_p = _rgba(_experiment_line_color(fig), _BAND_ALPHA)
+                bands += [
+                    *_band_pair(freq, stor, pred['E Storage'], fill_p,
+                                log_y=True, xaxis='x', yaxis='y',
+                                showlegend=True, name=_PRED_LEGEND),
+                    *_band_pair(freq, y_col2, pred[col2_key], fill_p,
+                                log_y=col2_log, xaxis='x2', yaxis='y2',
+                                name=_PRED_LEGEND),
+                ]
+            fill_c = _rgba(_prony_line_color(fig), _BAND_ALPHA)
+            bands += [
+                *_band_pair(freq, stor, sig['E Storage'], fill_c, log_y=True,
+                            xaxis='x', yaxis='y', showlegend=True,
+                            name=_CRED_LEGEND),
+                *_band_pair(freq, y_col2, sig[col2_key], fill_c,
+                            log_y=col2_log, xaxis='x2', yaxis='y2',
+                            name=_CRED_LEGEND),
+            ]
+            _prepend_traces(fig, bands)
 
     for fig in (fig1, fig11):
         fig.update_xaxes(exponentformat='power')

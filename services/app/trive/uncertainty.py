@@ -184,6 +184,70 @@ def complex_modulus_sigma(omega: np.ndarray, tau_i: np.ndarray,
     }
 
 
+def complex_modulus_noise(omega: np.ndarray, tau_i: np.ndarray,
+                          E_i: np.ndarray, omega_data: np.ndarray,
+                          rel_stor: np.ndarray, rel_loss: np.ndarray) -> dict:
+    """
+    1-sigma MEASUREMENT noise of a hypothetical new observation at each omega.
+
+    The other half of a prediction interval: where complex_modulus_sigma says
+    how well the fitted curve is pinned down, this says how far a fresh
+    instrument reading would scatter around it. Combined in quadrature
+    (var_prediction = var_credible + var_noise) they answer "where would a new
+    data point land"; this function deliberately returns the noise part alone
+    so callers drawing both bands reuse one credible evaluation.
+
+    The noise model is the data's own RELATIVE profile: the caller supplies
+    sigma_i / |E*_i| at the measured frequencies, which is interpolated in
+    log-frequency (edge-clamped beyond the window) and scaled by the FITTED
+    |E*(omega)|. For the relative-error setting this reproduces
+    sigma = rel * |E*| exactly on any grid; for uploaded error columns it
+    carries the empirical profile across the curve grid, and past the window
+    it extrapolates as constant relative noise on the extrapolated modulus —
+    the natural reading of "a similar instrument measuring there".
+
+    tan delta noise treats the new E' and E'' readings as INDEPENDENT
+    (var = (sigma''/E')**2 + (E'' * sigma'/E'**2)**2); a shared uploaded
+    'Error' column still describes two separate measurements, so no
+    covariance term is added.
+
+    Parameters:
+        omega (numpy.ndarray): 1-D array of angular frequencies to evaluate on
+            — the same grid the curves and credible sigmas use.
+        tau_i (numpy.ndarray): 1-D array of relaxation times.
+        E_i (numpy.ndarray): 1-D coefficient array, length N or N + 1.
+        omega_data (numpy.ndarray): 1-D array of the MEASURED frequencies.
+        rel_stor (numpy.ndarray): sigma / |E*| of the storage modulus at
+            omega_data (std_scale already applied).
+        rel_loss (numpy.ndarray): same for the loss modulus.
+
+    Returns:
+        dict: {'E Storage', 'E Loss', 'tan delta'} -> 1-D 1-sigma noise arrays
+        over omega, in modulus units (dimensionless for tan delta).
+    """
+    basis = prony_basis(omega, tau_i, solid=len(E_i) > len(tau_i))
+    curve = basis @ E_i
+    n = len(omega)
+    E_stor, E_loss = curve[:n], curve[n:]
+    mag = np.abs(E_stor + 1.0j * E_loss)
+
+    order = np.argsort(omega_data)
+    log_w = np.log(omega)
+    log_wd = np.log(omega_data[order])
+    sig_stor = np.interp(log_w, log_wd, rel_stor[order]) * mag
+    sig_loss = np.interp(log_w, log_wd, rel_loss[order]) * mag
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sig_tan = np.sqrt(
+            (sig_loss / E_stor) ** 2 + (E_loss * sig_stor / E_stor ** 2) ** 2
+        )
+    return {
+        'E Storage': sig_stor,
+        'E Loss': sig_loss,
+        'tan delta': sig_tan,
+    }
+
+
 def relaxation_sigma(t: np.ndarray, tau_i: np.ndarray, E_i: np.ndarray,
                      covariance: np.ndarray) -> np.ndarray:
     """

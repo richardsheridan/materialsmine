@@ -352,7 +352,14 @@ class TestExtractRoute(unittest.TestCase):
             t.get('name')
             for t in response['relaxation-chart']['data']
         ]
-        self.assertEqual(band_names.count('±1σ'), 2)
+        self.assertEqual(band_names.count('±1σ credible'), 2)
+        # The measured-domain figure carries both ribbon kinds.
+        complex_names = [
+            t.get('name')
+            for t in response['complex-chart']['data']
+        ]
+        self.assertEqual(complex_names.count('±1σ credible'), 4)
+        self.assertEqual(complex_names.count('±1σ prediction'), 4)
 
     def test_frequency_peak_estimation_returns_400(self):
         """

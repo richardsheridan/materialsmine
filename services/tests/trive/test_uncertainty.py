@@ -19,6 +19,7 @@ from app.trive.uncertainty import (
     _split_terms,
     sigma_log_coefficients,
     spectrum_error_bars,
+    complex_modulus_noise,
     complex_modulus_sigma,
     relaxation_sigma,
 )
@@ -180,6 +181,91 @@ class TestDeltaMethod(unittest.TestCase):
         gs = basis[:n] * self.E_i[1:]
         expected = np.sqrt(np.einsum('ij,ij->i', gs @ cov_dec, gs))
         np.testing.assert_allclose(got['E Storage'], expected, rtol=1e-12)
+
+
+class TestComplexModulusNoise(unittest.TestCase):
+    """The measurement-noise half of the prediction interval."""
+
+    def setUp(self):
+        self.rng = np.random.default_rng(31)
+        self.tau_i = np.logspace(-2, 2, 6)
+        self.E_i = np.abs(self.rng.normal(size=7)) + 0.5
+        self.omega_data = np.logspace(-2, 2, 25)
+
+    def _fit_curve(self, omega):
+        basis = prony_basis(omega, self.tau_i, solid=True)
+        curve = basis @ self.E_i
+        n = len(omega)
+        return curve[:n], curve[n:]
+
+    def test_constant_relative_profile_inverts_exactly(self):
+        # The relative-error setting: rel = const at every data point must
+        # come back as sigma = rel * |E*_fit| on ANY evaluation grid — the
+        # extension region included, where the profile is edge-clamped.
+        rel = np.full(len(self.omega_data), 0.05)
+        omega = np.logspace(-4, 4, 40)  # wider than the data window
+        got = complex_modulus_noise(
+            omega, self.tau_i, self.E_i, self.omega_data, rel, rel)
+        stor, loss = self._fit_curve(omega)
+        mag = np.abs(stor + 1.0j * loss)
+        np.testing.assert_allclose(got['E Storage'], 0.05 * mag, rtol=1e-12)
+        np.testing.assert_allclose(got['E Loss'], 0.05 * mag, rtol=1e-12)
+
+    def test_profile_interpolates_in_log_frequency_and_clamps(self):
+        # A profile that ramps across the window: evaluated at a data point
+        # it returns that point's value; beyond the window it holds the edge
+        # value (times the local fitted magnitude).
+        rel = np.linspace(0.01, 0.10, len(self.omega_data))
+        probe = np.array([1e-5, self.omega_data[7], 1e5])
+        got = complex_modulus_noise(
+            probe, self.tau_i, self.E_i, self.omega_data, rel, rel)
+        stor, loss = self._fit_curve(probe)
+        mag = np.abs(stor + 1.0j * loss)
+        expected_rel = np.array([rel[0], rel[7], rel[-1]])
+        np.testing.assert_allclose(
+            got['E Storage'] / mag, expected_rel, rtol=1e-12)
+
+    def test_unsorted_data_grid_is_handled(self):
+        # chart passes the upload's own order; the interp must not require it
+        # to be ascending.
+        rel = np.linspace(0.01, 0.10, len(self.omega_data))
+        perm = self.rng.permutation(len(self.omega_data))
+        omega = np.logspace(-3, 3, 30)
+        got = complex_modulus_noise(
+            omega, self.tau_i, self.E_i, self.omega_data, rel, rel)
+        shuffled = complex_modulus_noise(
+            omega, self.tau_i, self.E_i,
+            self.omega_data[perm], rel[perm], rel[perm])
+        np.testing.assert_allclose(shuffled['E Storage'], got['E Storage'])
+
+    def test_tan_delta_noise_is_the_independent_ratio_formula(self):
+        # var(tan d) = (sigma''/E')**2 + (E'' sigma'/E'**2)**2 for
+        # independent new readings of E' and E''.
+        rel_s = np.full(len(self.omega_data), 0.03)
+        rel_l = np.full(len(self.omega_data), 0.07)
+        omega = np.logspace(-2, 2, 15)
+        got = complex_modulus_noise(
+            omega, self.tau_i, self.E_i, self.omega_data, rel_s, rel_l)
+        stor, loss = self._fit_curve(omega)
+        expected = np.sqrt(
+            (got['E Loss'] / stor) ** 2
+            + (loss * got['E Storage'] / stor ** 2) ** 2)
+        np.testing.assert_allclose(got['tan delta'], expected, rtol=1e-12)
+
+    def test_prediction_dominates_credible_in_quadrature(self):
+        # The combination the figures draw: hypot(credible, noise) is at
+        # least as large as either part, everywhere.
+        rel = np.full(len(self.omega_data), 0.05)
+        omega = np.logspace(-3, 3, 20)
+        cov = self.rng.normal(size=(7, 7)) * 0.05
+        cov = cov @ cov.T + 0.01 * np.eye(7)
+        cred = complex_modulus_sigma(omega, self.tau_i, self.E_i, cov)
+        data = complex_modulus_noise(
+            omega, self.tau_i, self.E_i, self.omega_data, rel, rel)
+        for key in cred:
+            pred = np.hypot(cred[key], data[key])
+            self.assertTrue((pred >= cred[key]).all())
+            self.assertTrue((pred >= data[key]).all())
 
 
 class TestBandsOnARealFit(unittest.TestCase):

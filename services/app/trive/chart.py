@@ -332,10 +332,18 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     plot_df, freq_decimation = _decimate_for_plot(df)
     # ±1σ display rides on the Laplace posterior covariance when the fit has
     # one (smoothed path, positive-definite Hessian); None degrades every
-    # consumer to today's band-free output.
+    # consumer to today's band-free output. The frequency-domain figures also
+    # get a prediction band (credible + measurement noise): pass the noise the
+    # fit actually ran with as a RELATIVE profile sigma / |E*|, which
+    # complex_modulus_noise re-scales by the fitted curve on any grid — for
+    # the relative-error setting this inverts back to the setting exactly.
     covariance = fit_quality.covariance
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_mag = std_scale / np.abs(E_stor_arr + 1.0j * E_loss_arr)
+    noise = (df['Frequency'].to_numpy(),
+             E_stor_std * inv_mag, E_loss_std * inv_mag)
     fig1, fig11 = _build_complex_figures(
-        plot_df, tau_i, E_i, N_nz, covariance=covariance)
+        plot_df, tau_i, E_i, N_nz, covariance=covariance, noise=noise)
     # Order sets the rows: the readout takes the one nearest the plot and the
     # decimation notice stacks above it. See _stamp_notice.
     _annotate_fit_quality((fig1, fig11), fit_quality)

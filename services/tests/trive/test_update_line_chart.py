@@ -120,7 +120,8 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
         names2 = {t.name for t in fig2.data}
         self.assertTrue(any('Basis' in n for n in names2))
         self.assertEqual(
-            [t.name for t in fig2.data[:2]], ['±1σ', '±1σ'])
+            [t.name for t in fig2.data[:2]],
+            ['±1σ credible', '±1σ credible'])
 
     def test_fig3_is_discrete_spectrum_dot_plot(self):
         # fig3 is the discrete relaxation spectrum: the Prony coefficients as
@@ -682,33 +683,81 @@ class TestUpdateLineChartUncertaintyBands(unittest.TestCase):
         )
 
     @staticmethod
-    def _bands(fig):
-        return [t for t in fig.data if t.name == '±1σ']
+    def _bands(fig, kind='±1σ'):
+        return [t for t in fig.data if (t.name or '').startswith(kind)]
 
     def test_smoothed_run_draws_ribbons_under_the_curves(self):
+        # fig1/fig11 carry BOTH ribbon kinds (the frequency-domain moduli are
+        # directly measured, so a prediction band is meaningful); fig2 is an
+        # interconversion and carries the credible ribbon only.
         fig1, fig11, fig2 = self._run(0.1)[:3]
-        for fig, n_pairs in ((fig1, 2), (fig11, 2), (fig2, 1)):
-            bands = self._bands(fig)
-            self.assertEqual(len(bands), 2 * n_pairs)
-            # Every ribbon trace precedes every px trace, so the bands draw
-            # under both the experiment and fit lines.
-            self.assertEqual([t.name for t in fig.data[:2 * n_pairs]],
-                             ['±1σ'] * 2 * n_pairs)
-            # Exactly one legend entry toggles them all (shared legendgroup).
-            self.assertEqual(sum(bool(t.showlegend) for t in bands), 1)
-            self.assertEqual({t.legendgroup for t in bands}, {'±1σ'})
+        for fig, cred_pairs, pred_pairs in (
+                (fig1, 2, 2), (fig11, 2, 2), (fig2, 1, 0)):
+            cred = self._bands(fig, '±1σ credible')
+            pred = self._bands(fig, '±1σ prediction')
+            self.assertEqual(len(cred), 2 * cred_pairs)
+            self.assertEqual(len(pred), 2 * pred_pairs)
+            n_bands = 2 * (cred_pairs + pred_pairs)
+            # Draw order: every prediction trace first, then every credible
+            # trace, then the px traces — so the widest band paints lowest.
+            names = [t.name for t in fig.data[:n_bands]]
+            self.assertEqual(
+                names,
+                ['±1σ prediction'] * 2 * pred_pairs
+                + ['±1σ credible'] * 2 * cred_pairs)
+            self.assertNotIn('±1σ', [t.name for t in fig.data[n_bands:]])
+            # One legend entry per band kind toggles all of that kind.
+            for group in (cred, pred):
+                if group:
+                    self.assertEqual(
+                        sum(bool(t.showlegend) for t in group), 1)
+                    self.assertEqual({t.legendgroup for t in group},
+                                     {group[0].name})
             # Pairs stay adjacent: fill='tonexty' binds to the PREVIOUS trace
             # in data order, so it sits on the 2nd trace of each pair only.
-            for k, t in enumerate(bands):
-                self.assertEqual(t.fill, 'tonexty' if k % 2 else None)
+            for group in (pred, cred):
+                for k, t in enumerate(group):
+                    self.assertEqual(t.fill, 'tonexty' if k % 2 else None)
+
+    def test_band_colors_follow_their_traces(self):
+        # The credible band wears the Prony line's color, the prediction band
+        # the Experiment trace's — px defaults, read off the built figure.
+        fig1 = self._run(0.1)[0]
+        prony = next(t for t in fig1.data if 'Term Prony' in (t.name or ''))
+        exp = next(t for t in fig1.data if t.name == 'Experiment')
+
+        def rgb(hexcolor):
+            return tuple(int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
+
+        cred_fill = self._bands(fig1, '±1σ credible')[1].fillcolor
+        pred_fill = self._bands(fig1, '±1σ prediction')[1].fillcolor
+        self.assertEqual(cred_fill, 'rgba(%d,%d,%d,0.25)' % rgb(prony.line.color))
+        self.assertEqual(pred_fill, 'rgba(%d,%d,%d,0.25)' % rgb(exp.line.color))
+        self.assertNotEqual(cred_fill, pred_fill)
+
+    def test_prediction_band_contains_the_credible_band(self):
+        # var_prediction = var_credible + measurement noise, so at every
+        # point the prediction ribbon's upper edge sits at or above the
+        # credible ribbon's and its lower edge at or below.
+        fig1 = self._run(0.1)[0]
+        cred = self._bands(fig1, '±1σ credible')
+        pred = self._bands(fig1, '±1σ prediction')
+        for pair in range(2):
+            cred_lo, cred_hi = cred[2 * pair], cred[2 * pair + 1]
+            pred_lo, pred_hi = pred[2 * pair], pred[2 * pair + 1]
+            self.assertTrue((np.asarray(pred_hi.y)
+                             >= np.asarray(cred_hi.y)).all())
+            self.assertTrue((np.asarray(pred_lo.y)
+                             <= np.asarray(cred_lo.y)).all())
 
     def test_facet_axis_assignment(self):
         # Col 1 (E Storage) on ('x','y'), col 2 (E Loss / tan delta) on
         # ('x2','y2') — explicit, or the fill would leak across facets.
         for fig in self._run(0.1)[:2]:
-            self.assertEqual(
-                [(t.xaxis, t.yaxis) for t in self._bands(fig)],
-                [('x', 'y'), ('x', 'y'), ('x2', 'y2'), ('x2', 'y2')])
+            for kind in ('±1σ credible', '±1σ prediction'):
+                self.assertEqual(
+                    [(t.xaxis, t.yaxis) for t in self._bands(fig, kind)],
+                    [('x', 'y'), ('x', 'y'), ('x2', 'y2'), ('x2', 'y2')])
 
     def test_log_panel_lower_edges_stay_positive(self):
         # The harmonic lower edge y²/(y+σ): a log axis must never see 0.
