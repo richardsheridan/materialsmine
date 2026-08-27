@@ -78,10 +78,12 @@ def upsert_np_graphs_strict_transaction(
     jsonld_text: str,
     only_these_suffixes: Optional[List[str]] = None,  # e.g. ["#assertion", "#provenance", "#pubinfo", "#head"]
     timeout: int = 120,
+    append_only: bool = False,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Build ONE SPARQL Update that clears and inserts all graphs in the nanopublication.
     Runs as a single transactional operation in Fuseki.
+    When append_only=True, skips the CLEAR step so new triples are added to existing graphs.
     Returns (ok, report).
     """
     base = Config.FUSEKI_BASE_URL or "http://host.docker.internal:3032"
@@ -109,12 +111,14 @@ def upsert_np_graphs_strict_transaction(
             continue
 
         nt = _nt_for_context(ctx).strip()
-        # CLEAR GRAPH + INSERT DATA for this graph
         if nt:
-            updates.append(f"CLEAR SILENT GRAPH <{graph_uri}> ; INSERT DATA {{ GRAPH <{graph_uri}> {{\n{nt}\n}} }}")
+            if append_only:
+                updates.append(f"INSERT DATA {{ GRAPH <{graph_uri}> {{\n{nt}\n}} }}")
+            else:
+                updates.append(f"CLEAR SILENT GRAPH <{graph_uri}> ; INSERT DATA {{ GRAPH <{graph_uri}> {{\n{nt}\n}} }}")
         else:
-            # If empty graph, just clear it.
-            updates.append(f"CLEAR SILENT GRAPH <{graph_uri}>")
+            if not append_only:
+                updates.append(f"CLEAR SILENT GRAPH <{graph_uri}>")
         graphs_summary[graph_uri] = {"triples": nt.count("\n")}
 
     if not updates:
@@ -143,5 +147,90 @@ def upsert_np_graphs_strict_transaction(
             "ok": False,
             "graphs": graphs_summary,
             "endpoint": endpoint,
+            "error": str(e),
+        }
+
+
+def delete_np_graphs(
+    entity_uri: str,
+    timeout: int = 120,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Discover and delete all named graphs whose URI starts with entity_uri.
+    Runs a SPARQL query to find matching graphs, then issues CLEAR SILENT GRAPH
+    for each in a single transactional update.
+    Returns (ok, report).
+    """
+    base = Config.FUSEKI_BASE_URL or "http://host.docker.internal:3032"
+    dataset = Config.FUSEKI_DATASET
+    user = Config.FUSEKI_USER
+    pwd = Config.FUSEKI_PWD
+    auth = (user, pwd) if user and pwd else None
+
+    query_endpoint = f"{base}/{dataset}/sparql"
+    update_endpoint = f"{base}/{dataset}/update"
+
+    discovery_query = (
+        f'SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }} '
+        f'FILTER(STRSTARTS(STR(?g), "{entity_uri}")) }}'
+    )
+
+    try:
+        r = requests.post(
+            query_endpoint,
+            data={"query": discovery_query},
+            headers={"Accept": "application/sparql-results+json"},
+            auth=auth,
+            timeout=timeout,
+        )
+        if not (200 <= r.status_code < 300):
+            return False, {
+                "ok": False,
+                "stage": "discovery",
+                "status": r.status_code,
+                "error": r.text,
+            }
+
+        bindings = r.json().get("results", {}).get("bindings", [])
+        graph_uris = [b["g"]["value"] for b in bindings if "g" in b]
+    except Exception as e:
+        return False, {
+            "ok": False,
+            "stage": "discovery",
+            "status": 0,
+            "error": str(e),
+        }
+
+    if not graph_uris:
+        return True, {
+            "ok": True,
+            "graphs_deleted": [],
+            "message": "No named graphs found for this entity.",
+        }
+
+    clears = [f"CLEAR SILENT GRAPH <{g}>" for g in graph_uris]
+    update_body = ";\n".join(clears) + "\n"
+
+    try:
+        r = requests.post(
+            update_endpoint,
+            data=update_body.encode("utf-8"),
+            headers={"Content-Type": "application/sparql-update; charset=utf-8"},
+            auth=auth,
+            timeout=timeout,
+        )
+        ok = 200 <= r.status_code < 300
+        return ok, {
+            "ok": ok,
+            "status": r.status_code,
+            "graphs_deleted": graph_uris if ok else [],
+            "error": None if ok else r.text,
+        }
+    except Exception as e:
+        return False, {
+            "ok": False,
+            "stage": "update",
+            "status": 0,
+            "graphs_deleted": [],
             "error": str(e),
         }

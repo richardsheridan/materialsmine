@@ -48,6 +48,7 @@ export default {
         originalName: '',
       },
       dynamfitSurpriseRequest: 0,
+      dynamfitSddProgress: null,
       dynamfitTransformTabRequest: 0,
       dynamfitResetCount: 0,
       dynamfit: {

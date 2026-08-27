@@ -9,7 +9,8 @@ const CH = require('../utils/curation-utility'); // Curation Helper
 const Builder = require('../utils/curation-builder');
 const FileManager = require('../utils/fileManager');
 const BaseSchemaObject = require('../../config/xlsx.json');
-// const { NP_BASE } = require('../../config/constant'); // Now used only in curation-builder
+const { NP_BASE, MM_BASE } = require('../../config/constant');
+const { manageServiceRequest } = require('./managedServiceController');
 const { errorWriter, successWriter } = require('../utils/logWriter');
 const latency = require('../middlewares/latencyTimer');
 const {
@@ -28,6 +29,7 @@ const DatasetId = require('../models/datasetId');
 const FsFile = require('../models/fsFiles');
 const Task = require('../sw/models/task');
 const ChangeLog = require('../models/changeLog');
+const JobsController = require('./jobs');
 const FileStorage = require('../middlewares/fileStorage');
 const FileController = require('./fileController');
 const { loadViscoelasticPropPipeline } = require('../pipelines/xml-pipeline');
@@ -1541,9 +1543,8 @@ exports.createMaterialObject = async (
                 path: file.path
               };
 
-              filteredObject[
-                BaseObjectSubstitutionMap[property] ?? property
-              ] = `/api/files/${filename}?isStore=true`;
+              filteredObject[BaseObjectSubstitutionMap[property] ?? property] =
+                `/api/files/${filename}?isStore=true`;
 
               const isTif = CH.isTifFile(file.path);
               if (isParentCall || isTif) {
@@ -1904,8 +1905,6 @@ exports.createChangeLog = async (req, res, next) => {
     };
 
     const changeLog = await ChangeLog.findOneAndUpdate(filter, update, options);
-
-    successWriter(req, JSON.stringify(changeLog), 'createChangeLog');
     latency.latencyCalculator(res);
 
     if (req.isBackendCall) return changeLog;
@@ -1948,17 +1947,21 @@ exports.getChangeLogs = async (req, res, next) => {
 
     // Map user objects to concatenated full name
     const formatUser = (entry) => {
-      const obj = typeof entry.toObject === 'function' ? entry.toObject() : entry;
+      const obj =
+        typeof entry.toObject === 'function' ? entry.toObject() : entry;
       const u = obj.user;
-      const name = u && typeof u === 'object'
-        ? `${u.givenName || ''} ${u.surName || ''}`.trim()
-        : u;
+      const name =
+        u && typeof u === 'object'
+          ? `${u.givenName || ''} ${u.surName || ''}`.trim()
+          : u;
       return { ...obj, user: name || 'Unknown' };
     };
 
     const formatted = Array.isArray(changeLogs)
       ? changeLogs.map(formatUser)
-      : changeLogs ? formatUser(changeLogs) : changeLogs;
+      : changeLogs
+        ? formatUser(changeLogs)
+        : changeLogs;
 
     successWriter(req, JSON.stringify(formatted), 'getChangeLogs');
     latency.latencyCalculator(res);
@@ -2080,8 +2083,8 @@ exports.curationETL = async (req, res, next) => {
         sampleIdForFailure = nanopubId;
 
         // Serialize → SHACL validate → changelog (shared logic)
-        const { success, result, failure } =
-          await Builder.serializeAndValidate({
+        const { success, result, failure } = await Builder.serializeAndValidate(
+          {
             nanopubId,
             nanopub,
             assertionId,
@@ -2094,12 +2097,21 @@ exports.curationETL = async (req, res, next) => {
             res,
             next,
             createChangeLogCb: this.createChangeLog
-          });
+          }
+        );
 
         if (!success) {
           failed.push(failure);
           continue;
         }
+
+        // Silently update curation status to Completed
+        try {
+          await JobsController.updateStatus(id, 'Completed');
+        } catch (_e) {
+          /* silent */
+        }
+
         processed.push(result);
       } catch (e) {
         failed.push({
@@ -2153,76 +2165,199 @@ exports.sddCurationETL = async (req, res, next) => {
   }
 
   try {
-    const processed = [];
-    const failed = [];
-
     const rawId = nanopubSkeleton.id || `sdd-${Date.now()}`;
     const id = rawId.split('/').pop() || rawId;
 
-    try {
-      // Transform skeleton → nanopub
-      const { nanopubId, nanopub, assertionId } =
-        await Builder.transformSddToNanopub(nanopubSkeleton, logger);
+    // Transform skeleton → nanopub (first batch included in nanopub)
+    const {
+      nanopubId,
+      nanopub,
+      assertionId,
+      remainingBatches,
+      totalBatches,
+      _batchMeta
+    } = await Builder.transformSddToNanopub(nanopubSkeleton, logger);
 
-      // Serialize → SHACL validate → changelog (shared logic)
-      const { success, result, failure } =
-        await Builder.serializeAndValidate({
-          nanopubId,
-          nanopub,
-          assertionId,
-          output,
-          inference,
-          resolveUrls,
-          ontologyLink,
-          id,
-          req,
-          res,
-          next,
-          createChangeLogCb: this.createChangeLog
-        });
+    const isMultiBatch = totalBatches > 1;
 
-      if (!success) {
-        failed.push(failure);
-      } else {
-        processed.push(result);
-      }
-    } catch (e) {
-      failed.push({
-        id,
-        sampleID: null,
-        stage: 'unexpected',
-        errors: [String(e?.message || e)]
+    // Helper to build the final JSON response payload
+    const buildFinalPayload = () => {
+      const distArr =
+        nanopubSkeleton.distribution?.['mm:hasDistribution']?.[
+          'dcat:distribution'
+        ] || [];
+      const depictionFile =
+        nanopubSkeleton.depiction?.['mm:hasDepiction']?.['foaf:depiction']?.[0];
+      return {
+        description: nanopubSkeleton.description || '',
+        identifier: nanopubSkeleton.id || '',
+        label: nanopubSkeleton.title || '',
+        thumbnail: depictionFile?.['dcat:accessURL'] || '',
+        doi: nanopubSkeleton.doi || '',
+        organization: (nanopubSkeleton.organizations || []).map(
+          (org) => org.name
+        ),
+        distribution: (Array.isArray(distArr) ? distArr : [distArr]).map(
+          (d) => d['@id']
+        )
+      };
+    };
+
+    // SSE helper
+    const sendSSE = (eventData) => {
+      res.write(`data: ${JSON.stringify(eventData)}\n\n`);
+    };
+
+    // When in SSE mode, create a mock res/next so downstream functions
+    // (latencyCalculator, createChangeLog, managedServiceRequest) don't
+    // write headers or invoke Express error handling on the real response.
+    const mockRes = {
+      header: () => mockRes,
+      setHeader: () => mockRes,
+      set: () => mockRes,
+      get: (key) => res.get(key),
+      status: () => mockRes,
+      json: () => mockRes,
+      send: () => mockRes
+    };
+    const mockNext = (err) => {
+      if (err) throw typeof err === 'object' && err.message ? err : new Error(String(err));
+    };
+    const batchRes = isMultiBatch ? mockRes : res;
+    const batchNext = isMultiBatch ? mockNext : next;
+
+    if (isMultiBatch) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no'
       });
     }
 
-    if (failed.length) {
+    // --- Batch 1: full nanopub (creates all 4 named graphs) ---
+    logger.info(`sddCurationETL(): Processing batch 1/${totalBatches}`);
+    const batch1Result = await Builder.serializeAndValidate({
+      nanopubId,
+      nanopub,
+      assertionId,
+      output,
+      inference,
+      resolveUrls,
+      ontologyLink,
+      appendOnly: false,
+      id,
+      req,
+      res: batchRes,
+      next: batchNext,
+      createChangeLogCb: null
+    });
+
+    if (!batch1Result.success) {
+      if (isMultiBatch) {
+        sendSSE({
+          error: true,
+          batch: 1,
+          total: totalBatches,
+          failure: batch1Result.failure
+        });
+        return res.end();
+      }
       latency.latencyCalculator(res);
-      return res.status(400).json({ ok: false, failed });
+      return res
+        .status(400)
+        .json({ ok: false, failed: [batch1Result.failure] });
     }
 
-    // Build response from nanopubSkeleton fields
-    const distArr =
-      nanopubSkeleton.distribution?.['mm:hasDistribution']?.[
-        'dcat:distribution'
-      ] || [];
-    const depictionFile =
-      nanopubSkeleton.depiction?.['mm:hasDepiction']?.['foaf:depiction']?.[0];
+    if (isMultiBatch) {
+      sendSSE({ batch: 1, total: totalBatches, status: 'complete' });
+    }
+
+    // --- Remaining batches: append to existing assertion graph ---
+    for (let i = 0; i < remainingBatches.length; i++) {
+      const batchNum = i + 2;
+      logger.info(
+        `sddCurationETL(): Processing batch ${batchNum}/${totalBatches}`
+      );
+
+      const batchNanopub = Builder.buildBatchNanopub(
+        remainingBatches[i],
+        _batchMeta
+      );
+
+      const batchResult = await Builder.serializeAndValidate({
+        nanopubId,
+        nanopub: batchNanopub,
+        assertionId,
+        output,
+        inference,
+        resolveUrls: false,
+        ontologyLink,
+        appendOnly: true,
+        id,
+        req,
+        res: batchRes,
+        next: batchNext,
+        createChangeLogCb: null
+      });
+
+      if (!batchResult.success) {
+        logger.error(
+          `sddCurationETL(): Batch ${batchNum} failed`,
+          batchResult.failure
+        );
+        if (isMultiBatch) {
+          sendSSE({
+            error: true,
+            batch: batchNum,
+            total: totalBatches,
+            failure: batchResult.failure
+          });
+          return res.end();
+        }
+      }
+
+      if (isMultiBatch) {
+        sendSSE({ batch: batchNum, total: totalBatches, status: 'complete' });
+      }
+    }
+
+    // --- Changelog: one entry for the entire curation ---
+    try {
+      const changeLogReq = {
+        ...req,
+        method: 'POST',
+        body: {
+          change: [`SDD curation published (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})`],
+          resourceId: id,
+          published: true
+        },
+        isBackendCall: true
+      };
+      await this.createChangeLog(changeLogReq, batchRes, batchNext);
+    } catch (clErr) {
+      logger.error('sddCurationETL(): Changelog failed (non-fatal)', clErr);
+    }
+
+    // --- Final response ---
+    if (isMultiBatch) {
+      sendSSE({ done: true, ...buildFinalPayload() });
+      return res.end();
+    }
 
     latency.latencyCalculator(res);
-    return res.status(200).json({
-      description: nanopubSkeleton.description || '',
-      identifier: nanopubSkeleton.id || '',
-      label: nanopubSkeleton.title || '',
-      thumbnail: depictionFile?.['dcat:accessURL'] || '',
-      doi: nanopubSkeleton.doi || '',
-      organization: (nanopubSkeleton.organizations || []).map(
-        (org) => org.name
-      ),
-      distribution: (Array.isArray(distArr) ? distArr : [distArr]).map(
-        (d) => d['@id']
-      )
-    });
+    return res.status(200).json(buildFinalPayload());
   } catch (err) {
+    if (res.headersSent) {
+      try {
+        res.write(
+          `data: ${JSON.stringify({ error: true, message: String(err?.message || err) })}\n\n`
+        );
+      } catch (_) {
+        /* ignore write errors on closed connections */
+      }
+      return res.end();
+    }
     return next(errorWriter(req, err, 'sddCurationETL', 500));
   }
 };
@@ -2431,4 +2566,142 @@ const createBaseSchema = (baseObject, storedObject, logger) => {
   }
 
   return curatedBaseObject;
+};
+
+exports.deleteDataset = async (req, res, next) => {
+  const { logger } = req;
+  logger.info('deleteDataset(): Function Entry');
+  const { id } = req.params;
+
+  if (!id) {
+    return next(errorWriter(req, 'Dataset id is required', 'deleteDataset', 400));
+  }
+
+  try {
+    const entityUri = `${NP_BASE}${id}`;
+    const request = {
+      ...req,
+      method: 'DELETE',
+      body: { entity_uri: entityUri },
+      params: { appName: 'delete-nanopub' },
+      isBackendCall: true
+    };
+
+    const result = await manageServiceRequest(request, res, next);
+
+    await Builder.publishToChangeLog(
+      {
+        resp: {},
+        id,
+        failed: [],
+        sampleIdForFailure: null,
+        change: ['Dataset files removed from file store and triples deleted from knowledge graph']
+      },
+      req,
+      res,
+      next,
+      exports.createChangeLog
+    );
+
+    successWriter(req, { message: 'Dataset triples deleted' }, 'deleteDataset');
+    latency.latencyCalculator(res);
+    return res.status(200).json(result?.data ?? { message: 'ok' });
+  } catch (error) {
+    next(errorWriter(req, error?.message ?? 'Failed to delete dataset', 'deleteDataset', 500));
+  }
+};
+
+exports.submitDatasetToKG = async (req, res, next) => {
+  const { logger, body } = req;
+  logger.info('submitDatasetToKG(): Function Entry');
+  const { id } = req.params;
+
+  if (!id) {
+    return next(errorWriter(req, 'Dataset id is required', 'submitDatasetToKG', 400));
+  }
+
+  const { label, description, doi, organization, distribution, thumbnail } = body || {};
+
+  if (!distribution || !distribution.length) {
+    return next(errorWriter(req, 'Dataset must have at least one distribution file', 'submitDatasetToKG', 400));
+  }
+
+  try {
+    const npId = `${NP_BASE}${id}`;
+    const resId = `${MM_BASE}pnc/${id}`;
+
+    const distrLDs = (Array.isArray(distribution) ? distribution : [distribution]).map((url) => {
+      const urlObj = new URL(url, 'http://localhost');
+      const fileName = decodeURIComponent(urlObj.pathname.split('/').pop() || url);
+      return { '@id': url, 'rdfs:label': fileName };
+    });
+
+    const distributionLd = {
+      'mm:hasDistribution': {
+        '@id': `${resId}/attr/distribution`,
+        'dcat:distribution': distrLDs
+      }
+    };
+
+    let depictionLd = null;
+    if (thumbnail) {
+      const thumbName = decodeURIComponent(new URL(thumbnail, 'http://localhost').pathname.split('/').pop() || '');
+      depictionLd = {
+        'mm:hasDepiction': {
+          '@id': `${resId}/attr/depiction`,
+          'foaf:depiction': [{
+            '@id': `${resId}/attr/depiction/file`,
+            '@type': 'purl:File',
+            'rdfs:label': thumbName,
+            'dcat:accessURL': thumbnail
+          }]
+        }
+      };
+    }
+
+    const orgs = (organization || []).map((name) => ({ name }));
+    const contactPoint = req.user
+      ? { firstName: req.user.givenName || '', lastName: req.user.surName || '', cpEmail: req.user.email || '' }
+      : {};
+
+    const nanopubSkeleton = {
+      id: npId,
+      title: label || '',
+      description: description || '',
+      doi: doi || '',
+      datePub: null,
+      organizations: orgs,
+      contactPoint,
+      distribution: distributionLd,
+      depiction: depictionLd
+    };
+
+    const { nanopubId, nanopub, assertionId } =
+      await Builder.transformSddToNanopub(nanopubSkeleton, logger);
+
+    const { success, result, failure } = await Builder.serializeAndValidate({
+      nanopubId,
+      nanopub,
+      assertionId,
+      output: 'jsonld',
+      inference: 'rdfs',
+      resolveUrls: true,
+      id,
+      req,
+      res,
+      next,
+      createChangeLogCb: exports.createChangeLog
+    });
+
+    if (!success) {
+      latency.latencyCalculator(res);
+      return res.status(400).json({ ok: false, failed: [failure] });
+    }
+
+    successWriter(req, { message: 'Dataset submitted to knowledge graph' }, 'submitDatasetToKG');
+    latency.latencyCalculator(res);
+    return res.status(200).json({ ok: true, result });
+  } catch (error) {
+    next(errorWriter(req, error?.message ?? 'Failed to submit dataset to knowledge graph', 'submitDatasetToKG', 500));
+  }
 };

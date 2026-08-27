@@ -570,6 +570,16 @@
       <template v-slot:content>
         <div v-if="dialog.type == 'loading' && uploadInProgress">
           <spinner :text="uploadInProgress" />
+          <div v-if="sddProgress" style="margin-top: 0.8rem; text-align: center">
+            <div style="font-size: 0.9rem; color: #555; margin-bottom: 0.4rem">
+              Processing batch {{ sddProgress.batch }} of {{ sddProgress.total }}
+            </div>
+            <div style="background: #e0e0e0; border-radius: 4px; height: 8px; overflow: hidden">
+              <div
+                :style="{ width: Math.round((sddProgress.batch / sddProgress.total) * 100) + '%', height: '100%', background: '#0e5f76', transition: 'width 0.3s ease' }"
+              ></div>
+            </div>
+          </div>
         </div>
         <div v-else-if="dialog.type == 'success'">
           <div v-if="!!datasetId">Dataset with ID {{ datasetId }} successfully updated</div>
@@ -778,6 +788,7 @@ const externalSddLink = ref('');
 
 // Computed
 const dialogBoxActive = computed(() => store.getters['dialogBox']);
+const sddProgress = computed(() => store.state.explorer.dynamfitSddProgress);
 const doiData = computed(() => store.getters['explorer/curation/getDoiData']);
 const orcidData = computed(() => store.getters['explorer/curation/getOrcidData']);
 const organizations = computed(() => store.getters['explorer/curation/getRorData']);
@@ -1013,29 +1024,29 @@ const useDoiData = () => {
 };
 
 const previewFile = () => {
-  const preview = document.querySelector('#depictImg') as HTMLImageElement;
-  const wrapper = document.querySelector('#depictWrapper') as HTMLElement;
-  const previewMini = document.querySelector('#depictImgMini') as HTMLImageElement;
-  const wrapperMini = document.querySelector('#depictWrapperMini') as HTMLElement;
   const fileInput = document.querySelector('#file-depict-input') as HTMLInputElement;
   const file = fileInput?.files?.[0];
   if (!file) return;
 
-  const reader = new FileReader();
   depiction.value = file;
 
+  const reader = new FileReader();
   reader.addEventListener(
     'load',
     function () {
-      wrapper.style.visibility = wrapperMini.style.visibility = 'visible';
-      preview.src = previewMini.src = reader.result as string;
+      const preview = document.querySelector('#depictImg') as HTMLImageElement;
+      const wrapper = document.querySelector('#depictWrapper') as HTMLElement;
+      const previewMini = document.querySelector('#depictImgMini') as HTMLImageElement;
+      const wrapperMini = document.querySelector('#depictWrapperMini') as HTMLElement;
+      if (wrapper) wrapper.style.visibility = 'visible';
+      if (preview) preview.src = reader.result as string;
+      if (wrapperMini) wrapperMini.style.visibility = 'visible';
+      if (previewMini) previewMini.src = reader.result as string;
     },
     false
   );
 
-  if (file) {
-    reader.readAsDataURL(file);
-  }
+  reader.readAsDataURL(file);
 };
 
 const removeImage = () => {
@@ -1134,7 +1145,8 @@ const submitForm = async () => {
       dialog.value.type = 'success';
     } catch (err: any) {
       toggleDialogBox();
-      setSnackbar({ message: err.response ?? err });
+      const message = err?.failed?.[0]?.errors?.[0] ?? err.response ?? err;
+      setSnackbar({ message });
       clearFileList();
       doi.value = '';
       dataset.value = { ...DEFAULT_DATASET };

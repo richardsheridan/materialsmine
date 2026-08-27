@@ -36,6 +36,7 @@ export interface ExplorerState {
     originalName: string;
   };
   dynamfitSurpriseRequest: number;
+  dynamfitSddProgress: { batch: number; total: number } | null;
   // Bumped when an Update click applies an omega-T transform, so the visualizer
   // can jump to the cross-domain tab for that click and only that click.
   dynamfitTransformTabRequest: number;

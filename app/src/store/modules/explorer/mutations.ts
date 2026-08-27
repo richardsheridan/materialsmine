@@ -73,6 +73,9 @@ export default {
   triggerDynamfitSurprise(state: ExplorerState): void {
     state.dynamfitSurpriseRequest++;
   },
+  setDynamfitSddProgress(state: ExplorerState, payload: { batch: number; total: number } | null): void {
+    state.dynamfitSddProgress = payload;
+  },
   triggerDynamfitTransformTab(state: ExplorerState): void {
     state.dynamfitTransformTabRequest++;
   },
