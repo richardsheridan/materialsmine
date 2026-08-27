@@ -24,13 +24,16 @@ from .prony import prony_basis, prony_relaxation_space, PRONY_TERMS_MAX
 _QR_CHUNK_ROWS = 8192
 
 # Reduced systems retained by _prony_reduce's LRU cache. Each entry holds only
-# the (m + 1) x (m + 1) triangle — at most ~110 x 110, since the route caps N at
-# 100 and the rank probe adds 8 — so the cache stays tiny no matter how large
-# the uploads that produced it. Sized for a smoothness sweep, which varies only
-# `smoothness` and can reuse one reduction throughout. Each dataset now fills
-# TWO slots — the fit's grid and prony_rank_limits' fixed probe grid — so one
-# dataset's sweep still fits with room for a second dataset.
-_REDUCE_CACHE_SIZE = 4
+# the (m + 1) x (m + 1) triangle — a couple hundred rows at the extreme, since
+# the route caps user N at 100, the rank probe adds 8, and the smoothed path's
+# grid extension can add up to dof // 2 tail terms (fit._GRID_EXTENSION_DECADES)
+# — so the cache stays tiny no matter how large the uploads that produced it.
+# Sized for a smoothness sweep, which varies only `smoothness` and can reuse
+# one reduction throughout. Each dataset can fill THREE slots — the smoothed
+# fit's extended grid, the smoothness == 0 fit's unextended grid, and
+# prony_rank_limits' fixed probe grid — so 6 keeps one dataset's sweep resident
+# with room for a second dataset.
+_REDUCE_CACHE_SIZE = 6
 
 
 # digest -> (R, z), least-recently-used first. See _prony_reduce.

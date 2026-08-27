@@ -332,6 +332,28 @@ class TestExtractRoute(unittest.TestCase):
         self.assertTrue(mytable, 'expected at least one Prony coefficient record')
         self.assertEqual(set(mytable[0]), {'i', 'tau_i', 'E_i'})
 
+    def test_smoothed_extract_serializes_uncertainty_end_to_end(self):
+        """
+        The ±1σ additions ride inside existing keys, as finite floats: a
+        smoothed extract must survive stdlib json.dumps (which raises on
+        numpy scalars and emits invalid JSON for inf/nan) and carry the
+        sigma column in mytable. The default-body tests above stay on the
+        smoothness=0 path and pin the band-free schema.
+        """
+        resp = self._post(self._freq_body(smoothness=0.1))
+        self.assertEqual(resp.status_code, 200, resp.data[:400])
+        response = json.loads(resp.data)['response']
+        mytable = response['mytable']
+        self.assertTrue(mytable)
+        for row in mytable:
+            self.assertEqual(set(row), {'i', 'tau_i', 'E_i', 'sigma_log_E_i'})
+            self.assertIsInstance(row['sigma_log_E_i'], float)
+        band_names = [
+            t.get('name')
+            for t in response['relaxation-chart']['data']
+        ]
+        self.assertEqual(band_names.count('±1σ'), 2)
+
     def test_frequency_peak_estimation_returns_400(self):
         """
         Tg/TC estimation is temperature-domain only: a master curve's tan-δ

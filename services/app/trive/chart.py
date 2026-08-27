@@ -330,7 +330,12 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # (figures only — the fit above already consumed every row).
     df = df[['Frequency', 'E Storage', 'E Loss']]
     plot_df, freq_decimation = _decimate_for_plot(df)
-    fig1, fig11 = _build_complex_figures(plot_df, tau_i, E_i, N_nz)
+    # ±1σ display rides on the Laplace posterior covariance when the fit has
+    # one (smoothed path, positive-definite Hessian); None degrades every
+    # consumer to today's band-free output.
+    covariance = fit_quality.covariance
+    fig1, fig11 = _build_complex_figures(
+        plot_df, tau_i, E_i, N_nz, covariance=covariance)
     # Order sets the rows: the readout takes the one nearest the plot and the
     # decimation notice stacks above it. See _stamp_notice.
     _annotate_fit_quality((fig1, fig11), fit_quality)
@@ -338,8 +343,9 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # number_of_prony is the EFFECTIVE count here (the temperature branch may
     # have capped it above), which is what the caption should compare against.
     _annotate_rank_limit((fig1, fig11), number_of_prony, noise_prony)
-    fig2, fig3 = _build_relaxation_figures(tau_i, E_i, N_nz, fit_settings)
-    coef_records = _build_coef_records(tau_i, E_i)
+    fig2, fig3 = _build_relaxation_figures(
+        tau_i, E_i, N_nz, fit_settings, covariance=covariance)
+    coef_records = _build_coef_records(tau_i, E_i, covariance=covariance)
 
     return (fig1, fig11, fig2, fig3, fig4, fig41, coef_records,
             shift_fig, shift_records,

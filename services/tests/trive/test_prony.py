@@ -44,6 +44,8 @@ from app.trive.fit import (
     _PlateauProjectedProblem,
     _newton_watchdog,
     _NewtonBudgetExceeded,
+    _extended_relaxation_space,
+    _GRID_EXTENSION_DECADES,
     SmoothPronyFitTimeout,
 )
 from app.trive.calibration import argmax_peak
@@ -901,6 +903,84 @@ class TestPronyFitQuality(unittest.TestCase):
             quality.chi2_reduced, expected, delta=1e-6 * expected,
         )
 
+    def test_covariance_reduces_to_classical_least_squares(self):
+        # At an exact fit (residual identically zero) with a vanishing penalty,
+        # Hess V = 2 J.T @ J with J = basis * coefs, so Sigma = 2 * inv(Hess V)
+        # must reduce to the classical (J.T W J)^-1 of weighted least squares —
+        # the factor of 2 between V (which carries chi2) and the Gaussian
+        # log-likelihood (which carries chi2/2) cancels here, which is the
+        # sanity check that pins it.
+        basis = np.abs(self.rng.normal(size=(30, 9))) + 0.3
+        truth = np.exp(self.rng.normal(size=9))
+        data = basis @ truth
+        quality = _prony_fit_quality(
+            np.log(truth), data, basis, 1e-8, True,
+            n_resid=len(data), log_range=LOG_RANGE,
+        )
+        J = basis * truth
+        np.testing.assert_allclose(
+            quality.covariance, np.linalg.inv(J.T @ J), rtol=1e-4,
+        )
+
+    def test_covariance_is_two_inverse_hessians(self):
+        # The definition at a moderate penalty, against the same Hessian the
+        # Newton solver uses: Sigma @ Hess V = 2 I, to a tolerance scaled by
+        # the conditioning the inversion actually faced. Exact symmetry is the
+        # re-symmetrization's contract, not a rounding accident.
+        smoothness = 1.0
+        basis, data, x = _converged_fit_problem(self.rng, smoothness=smoothness)
+        m = len(x)
+        n_resid = 2 * len(data)
+        quality = _prony_fit_quality(
+            x, data, basis, smoothness, True,
+            n_resid=n_resid, log_range=LOG_RANGE,
+        )
+        self.assertIsNotNone(quality.covariance)
+        np.testing.assert_array_equal(quality.covariance, quality.covariance.T)
+        self.assertTrue((np.diag(quality.covariance) > 0).all())
+        scaled = _scaled_smoothness(smoothness, m - 1, n_resid - m, LOG_RANGE)
+        H = _PronyLoss(data, basis, scaled, True).hess(x)
+        err = np.abs(quality.covariance @ H - 2 * np.eye(m)).max()
+        self.assertLess(
+            err,
+            1e-12 * np.linalg.norm(H) * np.linalg.norm(quality.covariance),
+        )
+
+    def test_covariance_none_when_smoothness_zero(self):
+        # Same availability as the posterior machinery: no penalty means the
+        # NNLS active set owns the zeros and log-space curvature is undefined.
+        basis, data, x = _random_fit_problem(self.rng, 8, True)
+        quality = _prony_fit_quality(
+            x, data, basis, 0.0, True, n_resid=2 * len(data), log_range=LOG_RANGE,
+        )
+        self.assertIsNone(quality.covariance)
+
+    def test_covariance_none_when_not_positive_definite(self):
+        # Not a local minimum -> no Laplace posterior to have a covariance of.
+        basis, data, _ = _converged_fit_problem(self.rng)
+        x = np.full(basis.shape[1], -10.0)
+        quality = _prony_fit_quality(
+            x, data, basis, 0.5, True, n_resid=2 * len(data), log_range=LOG_RANGE,
+        )
+        self.assertIsNone(quality.covariance)
+
+    def test_covariance_survives_fewer_than_three_taus(self):
+        # Deliberately NOT gated on npen >= 3: with the penalty identically
+        # zero the lam posterior is undefined, but the data still determines a
+        # curvature and hence a Sigma. Distinct availability conditions. An
+        # exact-fit point keeps the Hessian at 2 J.T @ J, positive definite by
+        # construction, so Sigma must actually be there.
+        basis = np.abs(self.rng.normal(size=(10, 3))) + 0.3
+        truth = np.exp(self.rng.normal(size=3))
+        data = basis @ truth
+        quality = _prony_fit_quality(
+            np.log(truth), data, basis, 1.5, True,
+            n_resid=len(data), log_range=LOG_RANGE,
+        )
+        self.assertIsNone(quality.neg_log_posterior)
+        self.assertIsNotNone(quality.covariance)
+        self.assertEqual(quality.covariance.shape, (3, 3))
+
 
 class TestPronyReduce(unittest.TestCase):
     """The extracted QR reduction and its content-addressed LRU cache."""
@@ -1232,10 +1312,12 @@ class TestSmoothPronyFit(unittest.TestCase):
         self.E_loss_std = np.ones_like(self.E_loss)
 
     def test_shape_viscous(self):
+        # grid_extension_decades=0.0 pins the classic N-term contract; the
+        # default extension's geometry has its own test class.
         tau_i, E_i = smooth_prony_fit(
             self.omega, self.E_stor, self.E_loss,
             E_stor_std=self.E_stor_std, E_loss_std=self.E_loss_std,
-            N=5, smoothness=1.0, solid=False,
+            N=5, smoothness=1.0, solid=False, grid_extension_decades=0.0,
         )
         self.assertEqual(tau_i.shape, (5,))
         self.assertEqual(E_i.shape, (5,))
@@ -1244,7 +1326,7 @@ class TestSmoothPronyFit(unittest.TestCase):
         tau_i, E_i = smooth_prony_fit(
             self.omega, self.E_stor, self.E_loss,
             E_stor_std=self.E_stor_std, E_loss_std=self.E_loss_std,
-            N=5, smoothness=1.0, solid=True,
+            N=5, smoothness=1.0, solid=True, grid_extension_decades=0.0,
         )
         self.assertEqual(tau_i.shape, (5,))
         self.assertEqual(E_i.shape, (6,))
@@ -1264,7 +1346,7 @@ class TestSmoothPronyFit(unittest.TestCase):
         tau_i, E_i = smooth_prony_fit(
             self.omega, self.E_stor, self.E_loss,
             E_stor_std=self.E_stor_std, E_loss_std=self.E_loss_std,
-            N=8, smoothness=1.0, solid=False,
+            N=8, smoothness=1.0, solid=False, grid_extension_decades=0.0,
         )
         self.assertEqual(tau_i.shape, (8,))
         self.assertEqual(E_i.shape, (8,))
@@ -1524,11 +1606,12 @@ class TestSmoothPronyFitReducedSolver(unittest.TestCase):
         kwargs = dict(E_stor_std=std, E_loss_std=std, N=50, solid=True)
         tau_i, E_exact = smooth_prony_fit(
             omega, E_stor, E_loss, smoothness=0.0, **kwargs)
-        _, E_smooth = smooth_prony_fit(
+        tau_smooth, E_smooth = smooth_prony_fit(
             omega, E_stor, E_loss, smoothness=0.01, **kwargs)
         self.assertTrue(np.all(np.isfinite(E_smooth)))
         chi2_exact = _chi2_per_point(omega, E_stor, E_loss, std, tau_i, E_exact)
-        chi2_smooth = _chi2_per_point(omega, E_stor, E_loss, std, tau_i, E_smooth)
+        chi2_smooth = _chi2_per_point(
+            omega, E_stor, E_loss, std, tau_smooth, E_smooth)
         self.assertLess(chi2_smooth, chi2_exact + 0.1)
 
     def test_smoothness_effect_is_term_count_invariant(self):
@@ -1709,10 +1792,13 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         # Variable projection's guarantee: E_eq is the closed-form
         # non-negative least-squares value given the returned decaying
         # coefficients, on the FULL weighted problem, not just the reduced one.
+        # Extension off: its long-tau terms shadow the equilibrium column and
+        # legitimately clamp E_eq to zero on this fixture; the projection
+        # optimality being pinned here needs the E_eq > 0 branch.
         omega, E_stor, E_loss, std = _unresolved_equilibrium_curve()
         tau_i, E_i = smooth_prony_fit(
             omega, E_stor, E_loss, E_stor_std=std, E_loss_std=std,
-            N=10, smoothness=0.1, solid=True,
+            N=10, smoothness=0.1, solid=True, grid_extension_decades=0.0,
         )
         self.assertGreater(E_i[0], 0)
         weights = np.concatenate((std, std))
@@ -1728,16 +1814,19 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         # The fit is then the solid=False fit of the decaying terms, and the
         # readout must say so with finite numbers rather than go blank: the
         # posterior is the one of the N-term problem the solver converged on.
+        # Extension off so the "same optimum" comparison below stays between
+        # two 10-term problems (and dodges the tail terms' plateau shadowing).
         omega, E_stor, E_loss, std = _unresolved_equilibrium_curve()
         kwargs = dict(E_stor_std=std, E_loss_std=std, N=10, smoothness=1.0,
-                      return_fit_quality=True)
+                      return_fit_quality=True, grid_extension_decades=0.0)
         _, E_solid, q_solid = smooth_prony_fit(
             omega, E_stor, E_loss, solid=True, **kwargs)
         _, E_visc, q_visc = smooth_prony_fit(
             omega, E_stor, E_loss, solid=False, **kwargs)
         self.assertEqual(E_solid[0], 0.0)
         self.assertEqual(len(E_solid), 11)
-        for value in q_solid:
+        for field in ('chi2_reduced', 'neg_log_posterior', 'curvature'):
+            value = getattr(q_solid, field)
             self.assertIsNotNone(value)
             self.assertTrue(np.isfinite(value))
         # Same optimum to within the one-parameter difference in dof that
@@ -1747,6 +1836,33 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
                                delta=5e-3 * q_visc.chi2_reduced)
         self.assertAlmostEqual(q_solid.neg_log_posterior,
                                q_visc.neg_log_posterior, delta=0.5)
+
+    def test_covariance_shape_follows_the_returned_parameterization(self):
+        # The consumer contract (see the _FitQuality header): Sigma has one row
+        # per returned log-coefficient. Interior path: len(E_i) rows, log E_eq
+        # first. Clamped path: the solver converged on the N-term solid=False
+        # problem, so N rows and no equilibrium row. NNLS path: no Sigma.
+        # Extension off: the clamped-path (10, 10) shape below is about which
+        # PARAMETERIZATION Sigma covers, not about the tail terms, and this
+        # fixture's E_eq only stays interior on the unextended grid.
+        omega, E_stor, E_loss, std = _unresolved_equilibrium_curve()
+        kwargs = dict(E_stor_std=std, E_loss_std=std, N=10, solid=True,
+                      return_fit_quality=True, grid_extension_decades=0.0)
+        _, E_i, q = smooth_prony_fit(
+            omega, E_stor, E_loss, smoothness=0.1, **kwargs)
+        self.assertGreater(E_i[0], 0)
+        self.assertEqual(q.covariance.shape, (len(E_i), len(E_i)))
+        np.testing.assert_array_equal(q.covariance, q.covariance.T)
+        self.assertTrue((np.diag(q.covariance) > 0).all())
+
+        _, E_clamped, q_clamped = smooth_prony_fit(
+            omega, E_stor, E_loss, smoothness=1.0, **kwargs)
+        self.assertEqual(E_clamped[0], 0.0)
+        self.assertEqual(q_clamped.covariance.shape, (10, 10))
+
+        _, _, q_nnls = smooth_prony_fit(
+            omega, E_stor, E_loss, smoothness=0.0, **kwargs)
+        self.assertIsNone(q_nnls.covariance)
 
     def test_plateau_projection_is_exact(self):
         # With E_eq > 0 the projected loss, gradient and Hessian must equal the
@@ -1800,6 +1916,122 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         projected = _PlateauProjectedProblem(data, basis, 0.3, log_cap=20.0)
         self.assertEqual(projected.fun(over[1:]), np.inf)
         self.assertTrue(np.all(np.isfinite(projected.jac(over[1:]))))
+
+
+class TestGridExtension(unittest.TestCase):
+    """The smoothed path's aesthetic widening of the relaxation-time grid."""
+
+    def test_in_window_nodes_coincide_with_the_classic_grid(self):
+        # Extension ADDS nodes at the in-window density; it never stretches N
+        # over a wider span. The per-side count is round(ext / h_dec) and the
+        # endpoints land n_ext * h_dec decades outside the window.
+        tau_min, tau_max, N = 1e-3, 1e3, 25
+        tau_i, n_ext = _extended_relaxation_space(
+            tau_min, tau_max, N, 10_000, True, 2.0)
+        h_dec = 6.0 / (N - 1)
+        self.assertEqual(n_ext, round(2.0 / h_dec))
+        self.assertGreater(n_ext, 0)
+        self.assertEqual(len(tau_i), N + 2 * n_ext)
+        np.testing.assert_allclose(
+            tau_i[n_ext:n_ext + N],
+            prony_relaxation_space(tau_min, tau_max, N),
+            rtol=1e-12,
+        )
+        self.assertAlmostEqual(
+            np.log10(tau_i[0]), -3 - n_ext * h_dec, places=10)
+        self.assertAlmostEqual(
+            np.log10(tau_i[-1]), 3 + n_ext * h_dec, places=10)
+
+    def test_extension_capped_by_degrees_of_freedom(self):
+        # headroom = n_res - 1 - solid - N and each step costs one node per
+        # side, so the cap headroom // 2 keeps dof >= 1 after extension.
+        tau_min, tau_max, N = 1e-2, 1e2, 10
+        tau_i, n_ext = _extended_relaxation_space(
+            tau_min, tau_max, N, 16, True, 2.0)
+        self.assertEqual(n_ext, (16 - 1 - 1 - 10) // 2)
+        self.assertEqual(len(tau_i), N + 2 * n_ext)
+        # No headroom at all -> exactly the classic grid.
+        tau_i, n_ext = _extended_relaxation_space(
+            tau_min, tau_max, N, 11, True, 2.0)
+        self.assertEqual(n_ext, 0)
+        np.testing.assert_array_equal(
+            tau_i, prony_relaxation_space(tau_min, tau_max, N))
+
+    def test_no_extension_for_degenerate_inputs(self):
+        # A degenerate span has no spacing to inherit; N < 2 likewise.
+        _, n_ext = _extended_relaxation_space(1.0, 1.0, 5, 1000, True, 2.0)
+        self.assertEqual(n_ext, 0)
+        grid, n_ext = _extended_relaxation_space(1e-2, 1e2, 1, 1000, True, 2.0)
+        self.assertEqual(n_ext, 0)
+        self.assertEqual(len(grid), 1)
+
+    def test_zero_extension_returns_the_classic_grid(self):
+        # The grid_extension_decades=0.0 seam bottoms out here.
+        grid, n_ext = _extended_relaxation_space(1e-2, 1e2, 9, 1000, True, 0.0)
+        self.assertEqual(n_ext, 0)
+        np.testing.assert_array_equal(
+            grid, prony_relaxation_space(1e-2, 1e2, 9))
+
+    def test_nnls_path_is_bit_identical_to_the_unextended_fit(self):
+        # smoothness == 0 must ignore the extension entirely — same grid, same
+        # coefficients, bit for bit — whatever the seam says.
+        omega, E_stor, E_loss, std = _broadband_master_curve(400)
+        kwargs = dict(E_stor_std=std, E_loss_std=std, N=20, smoothness=0.0,
+                      solid=True)
+        tau_a, E_a = smooth_prony_fit(omega, E_stor, E_loss, **kwargs)
+        tau_b, E_b = smooth_prony_fit(
+            omega, E_stor, E_loss, grid_extension_decades=5.0, **kwargs)
+        np.testing.assert_array_equal(tau_a, tau_b)
+        np.testing.assert_array_equal(E_a, E_b)
+        self.assertEqual(len(tau_a), 20)
+
+    def test_smoothed_fit_reports_the_extended_grid(self):
+        # Default extension end to end: the returned grid is the helper's, the
+        # coefficient vector follows it, everything finite.
+        omega, E_stor, E_loss, std = _broadband_master_curve(400)
+        tau_i, E_i = smooth_prony_fit(
+            omega, E_stor, E_loss, E_stor_std=std, E_loss_std=std,
+            N=30, smoothness=0.04, solid=True)
+        expected, n_ext = _extended_relaxation_space(
+            1 / omega.max(), 1 / omega.min(), 30, 2 * len(omega), True,
+            _GRID_EXTENSION_DECADES)
+        self.assertGreater(n_ext, 0)
+        np.testing.assert_array_equal(tau_i, expected)
+        self.assertEqual(len(E_i), len(tau_i) + 1)
+        self.assertTrue(np.all(np.isfinite(E_i)))
+
+    def test_extension_preserves_the_in_window_fit(self):
+        # The tail terms may only extrapolate cosmetically: the reconstructed
+        # modulus over the DATA window must stay within a few percent of the
+        # unextended fit's. (The dof drop of 2 * n_ext shifts the normalized
+        # penalty weight — a real, small, accepted effect; hence the loose
+        # tolerance.)
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        kwargs = dict(E_stor_std=std, E_loss_std=std, N=40, smoothness=0.04,
+                      solid=True)
+        tau_a, E_a = smooth_prony_fit(omega, E_stor, E_loss,
+                                      grid_extension_decades=0.0, **kwargs)
+        tau_b, E_b = smooth_prony_fit(omega, E_stor, E_loss, **kwargs)
+        self.assertGreater(len(tau_b), len(tau_a))
+        model_a = prony_basis(omega, tau_a, solid=True) @ E_a
+        model_b = prony_basis(omega, tau_b, solid=True) @ E_b
+        # Agreement judged against the error bars the fit ran with: the two
+        # reconstructions must sit well inside a fraction of one sigma of each
+        # other everywhere (the raw relative difference reaches a few percent
+        # at the window edges, where the tail terms shoulder some load).
+        sigma = np.concatenate((std, std))
+        self.assertLess((np.abs(model_b - model_a) / sigma).max(), 0.5)
+
+    def test_weak_smoothing_extended_fit_stays_finite(self):
+        # At smoothness ~1e-3 the extension tails are barely identifiable (a
+        # nearly flat valley); the solve must still converge inside the Newton
+        # watchdog budget with finite coefficients, not raise
+        # SmoothPronyFitTimeout.
+        omega, E_stor, E_loss, std = _broadband_master_curve(400)
+        tau_i, E_i = smooth_prony_fit(
+            omega, E_stor, E_loss, E_stor_std=std, E_loss_std=std,
+            N=30, smoothness=1e-3, solid=True)
+        self.assertTrue(np.all(np.isfinite(E_i)))
 
 
 class TestNewtonWatchdog(unittest.TestCase):

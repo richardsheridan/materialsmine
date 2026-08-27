@@ -16,7 +16,10 @@ bottom-up:
     quality      scoring a converged fit: reduced chi-squared, the Laplace
                  posterior of the smoothing weight, the spectrum's roughness
     fit          smooth_prony_fit — composes the four above into the single
-                 call that turns data into (tau_i, E_i)
+                 call that turns data into (tau_i, E_i), and widens the tau
+                 grid past the data window on the smoothed path
+    uncertainty  delta-method ±1σ bands from the fit's posterior covariance —
+                 the sigma-counterpart of prony's forward evaluations
 
     shift        WLF / Arrhenius / hybrid shift factors and their inverses
     calibration  the reverse direction — fitting C1/C2/Ea to measured shift

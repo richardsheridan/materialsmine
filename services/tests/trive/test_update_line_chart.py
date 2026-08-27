@@ -22,7 +22,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 from app.trive.prony import compute_complex, prony_terms_for_span
 from app.trive.quality import _FitQuality
-from app.trive.fit import smooth_prony_fit
+from app.trive.fit import (
+    smooth_prony_fit,
+    _extended_relaxation_space,
+    _GRID_EXTENSION_DECADES,
+)
 from app.trive.shift import wlf_shift, inverse_wlf_shift, inverse_hybrid_shift
 from app.trive.tts import MAX_ABS_LOG10_SHIFT
 from app.trive.figures import _PLOT_MAX_POINTS
@@ -46,6 +50,15 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
             'agilus30 (8) master curve 20C.txt', 'frequency',
         )
         cls.N = 10
+        # The smoothed path extends the tau grid past the data window
+        # (fit._GRID_EXTENSION_DECADES), so figure/table term counts follow
+        # the EXTENDED total, computed here from the same helper the fit uses
+        # rather than hardcoded.
+        freq = np.asarray(cls.uploadData['Frequency'], dtype=float)
+        cls.N_total = cls.N + 2 * _extended_relaxation_space(
+            1 / freq.max(), 1 / freq.min(), cls.N, 2 * len(freq), True,
+            _GRID_EXTENSION_DECADES,
+        )[1]
         cls.result = update_line_chart(
             cls.uploadData,
             number_of_prony=cls.N,
@@ -62,12 +75,18 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
         )
 
     def test_coef_df_schema(self):
+        # Smoothed fit with a covariance: the table carries the sigma column
+        # (a flat float per row — the frontend renders/exports rows as-is).
         coef_df = self.result[6]
         self.assertIsInstance(coef_df, list)
         self.assertGreater(len(coef_df), 0)
         for row in coef_df:
-            self.assertSetEqual(set(row.keys()), {'i', 'tau_i', 'E_i'})
+            self.assertSetEqual(
+                set(row.keys()), {'i', 'tau_i', 'E_i', 'sigma_log_E_i'})
             self.assertNotEqual(row['E_i'], 0.0)
+            self.assertIsInstance(row['sigma_log_E_i'], float)
+            self.assertTrue(np.isfinite(row['sigma_log_E_i']))
+            self.assertGreater(row['sigma_log_E_i'], 0.0)
         # 'i' values are the original DataFrame indices, all nonnegative
         self.assertTrue(all(row['i'] >= 0 for row in coef_df))
 
@@ -94,11 +113,14 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
             np.testing.assert_array_equal(got, want)
 
     def test_fig2_trace_counts_with_fit_settings_true(self):
-        # fit_settings=True → fig2 is an overlay fig (line + basis scatter).
+        # fit_settings=True → fig2 is an overlay fig (line + basis scatter),
+        # preceded by the ±1σ band pair on this smoothed fixture.
         fig2 = self.result[2]
-        self.assertEqual(len(fig2.data), 2)
+        self.assertEqual(len(fig2.data), 4)
         names2 = {t.name for t in fig2.data}
         self.assertTrue(any('Basis' in n for n in names2))
+        self.assertEqual(
+            [t.name for t in fig2.data[:2]], ['±1σ', '±1σ'])
 
     def test_fig3_is_discrete_spectrum_dot_plot(self):
         # fig3 is the discrete relaxation spectrum: the Prony coefficients as
@@ -110,11 +132,13 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
         self.assertFalse(any('Basis' in n for n in names3))
         dots = next(t for t in fig3.data if 'Term Prony' in t.name)
         self.assertEqual(dots.mode, 'markers')
-        self.assertEqual(len(dots.x), self.N)
+        self.assertEqual(len(dots.x), self.N_total)
         # Every figure labels the decaying terms only — the equilibrium
         # coefficient is a separate parameter, drawn here as its own trace — so
         # this label matches the one on the E(t) figure exactly.
-        decaying = int(self.result[2].data[0].name.split('-')[0])
+        fig2_prony = next(t.name for t in self.result[2].data
+                          if 'Term Prony' in (t.name or ''))
+        decaying = int(fig2_prony.split('-')[0])
         self.assertEqual(dots.name, f'{decaying}-Term Prony')
         hline = next(t for t in fig3.data if t.name == 'Long-Term Modulus')
         self.assertEqual(hline.mode, 'lines')
@@ -163,7 +187,8 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
             fit_settings=False, domain='frequency',
         )
         fig2, fig3 = result[2], result[3]
-        self.assertEqual(len(fig2.data), 1)
+        # Band pair + the fit line; the basis overlay alone is dropped.
+        self.assertEqual(len(fig2.data), 3)
         self.assertNotIn('Basis', {t.name for t in fig2.data})
         # fig3 is the discrete-spectrum dot plot regardless of fit_settings.
         self.assertEqual(
@@ -634,6 +659,103 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
         self.assertGreater(len(coef_df), 0)
 
 
+class TestUpdateLineChartUncertaintyBands(unittest.TestCase):
+    """The ±1σ display: ribbons, error bars, the sigma column — and their
+    clean absence on the paths that have no covariance."""
+
+    @staticmethod
+    def _upload():
+        tau = np.logspace(-4.0, 4.0, 9)
+        E_input = np.concatenate(
+            ([1e6], np.exp(-(np.log10(tau)) ** 2 / 4.0) * 1e9))
+        df = compute_complex(tau, E_input, num_pts=200)
+        return {
+            'Frequency': df['Frequency'].to_numpy(),
+            'E Storage': df['E Storage'].to_numpy(),
+            'E Loss': df['E Loss'].to_numpy(),
+        }
+
+    def _run(self, smoothness):
+        return update_line_chart(
+            self._upload(), number_of_prony=20, smoothness=smoothness,
+            fit_settings=True, domain='frequency',
+        )
+
+    @staticmethod
+    def _bands(fig):
+        return [t for t in fig.data if t.name == '±1σ']
+
+    def test_smoothed_run_draws_ribbons_under_the_curves(self):
+        fig1, fig11, fig2 = self._run(0.1)[:3]
+        for fig, n_pairs in ((fig1, 2), (fig11, 2), (fig2, 1)):
+            bands = self._bands(fig)
+            self.assertEqual(len(bands), 2 * n_pairs)
+            # Every ribbon trace precedes every px trace, so the bands draw
+            # under both the experiment and fit lines.
+            self.assertEqual([t.name for t in fig.data[:2 * n_pairs]],
+                             ['±1σ'] * 2 * n_pairs)
+            # Exactly one legend entry toggles them all (shared legendgroup).
+            self.assertEqual(sum(bool(t.showlegend) for t in bands), 1)
+            self.assertEqual({t.legendgroup for t in bands}, {'±1σ'})
+            # Pairs stay adjacent: fill='tonexty' binds to the PREVIOUS trace
+            # in data order, so it sits on the 2nd trace of each pair only.
+            for k, t in enumerate(bands):
+                self.assertEqual(t.fill, 'tonexty' if k % 2 else None)
+
+    def test_facet_axis_assignment(self):
+        # Col 1 (E Storage) on ('x','y'), col 2 (E Loss / tan delta) on
+        # ('x2','y2') — explicit, or the fill would leak across facets.
+        for fig in self._run(0.1)[:2]:
+            self.assertEqual(
+                [(t.xaxis, t.yaxis) for t in self._bands(fig)],
+                [('x', 'y'), ('x', 'y'), ('x2', 'y2'), ('x2', 'y2')])
+
+    def test_log_panel_lower_edges_stay_positive(self):
+        # The harmonic lower edge y²/(y+σ): a log axis must never see 0.
+        fig1, _, fig2 = self._run(0.1)[:3]
+        for fig in (fig1, fig2):
+            for lower in self._bands(fig)[::2]:
+                y = np.asarray(lower.y, dtype=float)
+                self.assertTrue(np.isfinite(y).all())
+                self.assertTrue((y > 0).all())
+
+    def test_fig3_error_bars_present_finite_and_asymmetric(self):
+        fig3 = self._run(0.1)[3]
+        dots = next(t for t in fig3.data if 'Term Prony' in t.name)
+        plus = np.asarray(dots.error_y.array, dtype=float)
+        minus = np.asarray(dots.error_y.arrayminus, dtype=float)
+        E = np.asarray(dots.y, dtype=float)
+        self.assertEqual(len(plus), len(E))
+        self.assertTrue(np.isfinite(plus).all())
+        self.assertTrue(np.isfinite(minus).all())
+        self.assertTrue((plus >= minus).all())  # log-normal asymmetry
+        self.assertTrue((minus < E).all())      # lower edge stays positive
+        # The Long-Term Modulus reference line carries no bar (deliberate).
+        hline = next((t for t in fig3.data if t.name == 'Long-Term Modulus'),
+                     None)
+        if hline is not None:
+            self.assertIsNone(hline.error_y.array)
+
+    def test_unsmoothed_run_has_no_uncertainty_display(self):
+        fig1, fig11, fig2, fig3, _, _, coef_df, _, _, _ = self._run(0.0)
+        for fig in (fig1, fig11, fig2, fig3):
+            self.assertEqual(self._bands(fig), [])
+        dots = next(t for t in fig3.data if 'Term Prony' in t.name)
+        self.assertIsNone(dots.error_y.array)
+        for row in coef_df:
+            self.assertNotIn('sigma_log_E_i', row)
+
+    def test_cholesky_failure_degrades_gracefully(self):
+        # No covariance -> exactly today's band-free output, no exception:
+        # the graceful-degradation guarantee behind covariance=None.
+        with patch('app.trive.quality._cholesky_or_none', return_value=None):
+            fig1, fig11, fig2, fig3, _, _, coef_df, _, _, _ = self._run(0.1)
+        for fig in (fig1, fig11, fig2, fig3):
+            self.assertEqual(self._bands(fig), [])
+        for row in coef_df:
+            self.assertNotIn('sigma_log_E_i', row)
+
+
 class TestUpdateLineChartTermLabels(unittest.TestCase):
     """
     Every "N-Term Prony" label counts decaying terms only. The equilibrium
@@ -667,14 +789,27 @@ class TestUpdateLineChartTermLabels(unittest.TestCase):
             fit_settings=True, domain='frequency',
         )
 
+    def _extended_total(self, N):
+        # On the smoothed path labels count the EXTENDED grid, so the slider
+        # value no longer numerically matches the label; compute the expected
+        # total from the same helper the fit uses.
+        freq = self._upload()['Frequency']
+        return N + 2 * _extended_relaxation_space(
+            1 / freq.max(), 1 / freq.min(), N, 2 * len(freq), True,
+            _GRID_EXTENSION_DECADES,
+        )[1]
+
     def test_smoothed_labels_match_the_coefficient_table(self):
         # Regression: on this path every coefficient is exp(...) and so never
         # exactly zero, which made the old count_nonzero over the whole vector
-        # report the grid size plus the equilibrium term — 24 terms for a
-        # 23-point grid whose table listed 23 rows.
+        # report the grid size plus the equilibrium term — one more term than
+        # the grid whose rows the table listed.
         fig1, fig11, fig2, fig3, _, _, coef_df, _, _, _ = self._run(23, 0.04)
-        self.assertEqual(len(coef_df), 23)
-        self.assertEqual(self._label_counts((fig1, fig11, fig2, fig3)), {23})
+        expected = self._extended_total(23)
+        self.assertGreater(expected, 23)  # the extension is actually on
+        self.assertEqual(len(coef_df), expected)
+        self.assertEqual(
+            self._label_counts((fig1, fig11, fig2, fig3)), {expected})
 
     def test_unsmoothed_labels_match_the_coefficient_table(self):
         # NNLS zeroes coefficients outright, so here the count is genuinely
@@ -689,7 +824,7 @@ class TestUpdateLineChartTermLabels(unittest.TestCase):
         # entry either.
         fig2 = self._run(23, 0.04)[2]
         basis = [t.name for t in fig2.data if 'Term Basis' in t.name]
-        self.assertEqual(basis, ['23-Term Basis'])
+        self.assertEqual(basis, [f'{self._extended_total(23)}-Term Basis'])
 
 
 class TestUpdateLineChartTemperaturePronyTerms(unittest.TestCase):

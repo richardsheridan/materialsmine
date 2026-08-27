@@ -16,6 +16,14 @@ import plotly.graph_objects as go
 from .prony import compute_complex, compute_relaxation_modulus
 from .shift import hybrid_shift, wlf_log10_shift
 from .tts import MAX_ABS_LOG10_SHIFT
+from .uncertainty import (
+    _SIGMA_DISPLAY_CAP,
+    _split_terms,
+    sigma_log_coefficients,
+    spectrum_error_bars,
+    complex_modulus_sigma,
+    relaxation_sigma,
+)
 
 
 # Experiment traces with more rows than this are thinned before plotting —
@@ -200,6 +208,107 @@ def _annotate_fit_quality(figs, quality) -> None:
     _stamp_notice(figs, " | ".join(parts + ["lower is better"]))
 
 
+# Opacity of the ±1σ ribbons — light enough that the experiment trace stays
+# readable through a band drawn UNDER it (see _prepend_traces).
+_BAND_ALPHA = 0.25
+
+# Legend name shared by every band trace on a figure. One trace per figure
+# shows it (see _band_pair's showlegend), and the shared legendgroup makes
+# that single entry toggle every ribbon at once.
+_BAND_LEGEND = '±1σ'
+
+
+def _rgba(color: str, alpha: float) -> str:
+    """
+    An rgba() version of a plotly trace color, for translucent band fills.
+
+    Handles the two forms px actually emits — '#rrggbb' hex from the default
+    colorway and 'rgb(...)' strings — and falls back to the color unchanged
+    (an opaque band, ugly but correct) for anything else.
+    """
+    color = color.strip()
+    if color.startswith('#') and len(color) == 7:
+        r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        return f'rgba({r},{g},{b},{alpha})'
+    if color.startswith('rgb(') and color.endswith(')'):
+        return f'rgba({color[4:-1]},{alpha})'
+    return color
+
+
+def _prony_line_color(fig) -> str:
+    """The line color px gave the Prony overlay trace on this figure.
+
+    Read off the BUILT figure rather than hardcoded, so the bands keep
+    matching if the colorway or trace order ever changes. Falls back to px's
+    second default color (the overlay's usual slot alongside 'Experiment').
+    """
+    for t in fig.data:
+        if 'Term Prony' in (t.name or '') and getattr(t.line, 'color', None):
+            return t.line.color
+    return '#EF553B'
+
+
+def _prepend_traces(fig, traces) -> None:
+    """
+    Insert traces BEFORE the figure's existing ones, in the given order.
+
+    Band ribbons must draw under both the experiment and fit lines, and
+    fill='tonexty' binds each upper band edge to the trace immediately before
+    it in DATA order — so each (lower, upper) pair has to land adjacent at the
+    front. plotly only accepts NEW traces via add_traces, so append then
+    rotate.
+    """
+    traces = tuple(traces)
+    if not traces:
+        return
+    n = len(traces)
+    fig.add_traces(traces)
+    fig.data = fig.data[-n:] + fig.data[:-n]
+
+
+def _band_pair(x, y, sigma, fillcolor: str, log_y: bool,
+               xaxis: str = None, yaxis: str = None,
+               showlegend: bool = False) -> tuple:
+    """
+    The (lower, upper) go.Scatter pair of a ±1σ ribbon around curve y.
+
+    The upper edge sits at y + σ with σ capped at y * (e^cap - 1) — the
+    six-decade display ceiling (_SIGMA_DISPLAY_CAP) that keeps an
+    unconstrained tail from detonating a log axis's autorange or stdlib json.
+    On log panels the lower edge is the harmonic form y² / (y + σ_capped):
+    positive by construction, exactly log-symmetric with the capped upper edge
+    (y·e^s above pairs with y·e^-s below), and equal to y - σ to O((σ/y)²)
+    where the band is tight. Linear panels use the plain max(y - σ, 0).
+
+    Both traces are invisible lines (the fill is the band), skip hover so they
+    don't shadow the curves, and share _BAND_LEGEND's legendgroup; exactly one
+    trace per FIGURE should pass showlegend=True. On faceted figures pass the
+    facet's axis pair ('x'/'y' for column 1, 'x2'/'y2' for column 2)
+    explicitly.
+
+    Returns:
+        tuple: (lower, upper) traces — keep them adjacent, lower first, since
+        fill='tonexty' fills from the PREVIOUS trace in data order.
+    """
+    y = np.asarray(y, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    capped = np.minimum(sigma, y * np.expm1(_SIGMA_DISPLAY_CAP))
+    upper = y + capped
+    lower = y * y / (y + capped) if log_y else np.maximum(y - sigma, 0.0)
+    common = dict(
+        mode='lines', line=dict(width=0),
+        name=_BAND_LEGEND, legendgroup=_BAND_LEGEND,
+        hoverinfo='skip', showlegend=False,
+    )
+    if xaxis is not None:
+        common.update(xaxis=xaxis, yaxis=yaxis)
+    return (
+        go.Scatter(x=x, y=lower, **common),
+        go.Scatter(x=x, y=upper, fill='tonexty', fillcolor=fillcolor,
+                   **{**common, 'showlegend': showlegend}),
+    )
+
+
 def _place_tan_delta_axis(fig) -> None:
     """
     Keep the tan delta facet's tick labels clear of both neighbors.
@@ -283,7 +392,7 @@ def _build_temperature_figures(temp_sweep_data: pd.DataFrame) -> tuple:
 
 
 def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
-                           N_nz: int) -> tuple:
+                           N_nz: int, covariance: np.ndarray = None) -> tuple:
     """
     Build E vs frequency and tan-delta vs frequency figures with Prony overlay.
 
@@ -295,10 +404,16 @@ def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
         N_nz (int): Number of nonzero DECAYING Prony coefficients, i.e. the
             equilibrium term excluded; used in trace names. Matches the row
             count of the coefficient table _build_coef_records returns.
+        covariance (numpy.ndarray): Posterior covariance of the fitted
+            log-coefficients (quality.covariance), or None for no ±1σ
+            ribbons. Bands are evaluated on the SAME frequency grid as the
+            overlay curve — compute_complex's own column — so they cannot
+            drift onto a different grid.
 
     Returns:
         tuple: (fig1, fig11) where fig1 is E' / E'' vs Frequency and fig11 is
-        E' / tan-delta vs Frequency.
+        E' / tan-delta vs Frequency, each with ±1σ ribbons under the curves
+        when covariance is given.
     """
     complex_df = compute_complex(tau_i, E_i)
     x_col, y_col, z_col = df.columns[0], df.columns[1], df.columns[2]
@@ -349,6 +464,29 @@ def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
     fig11.update_yaxes(matches=None, showticklabels=True)
     fig11.update_yaxes(type="log", col=1)
     _place_tan_delta_axis(fig11)
+
+    if covariance is not None:
+        freq = complex_df[cx_x].to_numpy()
+        sig = complex_modulus_sigma(freq, tau_i, E_i, covariance)
+        stor = complex_df[cx_y].to_numpy()
+        loss = complex_df[cx_z].to_numpy()
+        fill = _rgba(_prony_line_color(fig1), _BAND_ALPHA)
+        # Facet columns by data order of the melt: col 1 = E Storage on
+        # ('x','y'), col 2 = E Loss (fig1) / tan delta (fig11) on ('x2','y2').
+        _prepend_traces(fig1, (
+            *_band_pair(freq, stor, sig['E Storage'], fill, log_y=True,
+                        xaxis='x', yaxis='y', showlegend=True),
+            *_band_pair(freq, loss, sig['E Loss'], fill, log_y=True,
+                        xaxis='x2', yaxis='y2'),
+        ))
+        fill11 = _rgba(_prony_line_color(fig11), _BAND_ALPHA)
+        _prepend_traces(fig11, (
+            *_band_pair(freq, stor, sig['E Storage'], fill11, log_y=True,
+                        xaxis='x', yaxis='y', showlegend=True),
+            *_band_pair(freq, loss / stor, sig['tan delta'], fill11,
+                        log_y=False, xaxis='x2', yaxis='y2'),
+        ))
+
     for fig in (fig1, fig11):
         fig.update_xaxes(exponentformat='power')
         fig.update_yaxes(exponentformat='power')
@@ -356,7 +494,8 @@ def _build_complex_figures(df: pd.DataFrame, tau_i: np.ndarray, E_i: np.ndarray,
 
 
 def _build_relaxation_figures(tau_i: np.ndarray, E_i: np.ndarray, N_nz: int,
-                              fit_settings: bool) -> tuple:
+                              fit_settings: bool,
+                              covariance: np.ndarray = None) -> tuple:
     """
     Build relaxation-modulus and discrete-spectrum figures.
 
@@ -369,6 +508,10 @@ def _build_relaxation_figures(tau_i: np.ndarray, E_i: np.ndarray, N_nz: int,
             both figures.
         fit_settings (bool): If True, overlay the basis scatter on the
             relaxation-modulus figure; if False, return only its line trace.
+        covariance (numpy.ndarray): Posterior covariance of the fitted
+            log-coefficients, or None for no uncertainty display. Gives fig2 a
+            ±1σ ribbon and fig3 asymmetric per-coefficient error bars (the
+            Long-Term Modulus line deliberately carries none).
 
     Returns:
         tuple: (fig2, fig3) where fig2 is the time-domain relaxation modulus
@@ -389,6 +532,16 @@ def _build_relaxation_figures(tau_i: np.ndarray, E_i: np.ndarray, N_nz: int,
         autosize=False, width=800, height=450,
         margin=dict(l=80, r=60, t=60, b=80),
     )
+    if covariance is not None:
+        # Prepended to fig2a BEFORE the overlay merge below, so both
+        # fit_settings paths (merged figure and bare fig2a) carry the ribbon.
+        t = relax["Time"].to_numpy()
+        _prepend_traces(fig2a, _band_pair(
+            t, relax["E"].to_numpy(),
+            relaxation_sigma(t, tau_i, E_i, covariance),
+            _rgba(_prony_line_color(fig2a), _BAND_ALPHA),
+            log_y=True, showlegend=True,
+        ))
 
     basis_df = pd.DataFrame({
         "Time": tau_i,
@@ -423,11 +576,24 @@ def _build_relaxation_figures(tau_i: np.ndarray, E_i: np.ndarray, N_nz: int,
         "E": E_i[solid:],
         "Type": f"{N_nz}-Term Prony",
     })
+    error_kwargs = {}
+    if covariance is not None:
+        # Asymmetric error bars from the log-space sigmas: error bars are
+        # TRACE ATTRIBUTES in plotly, so this changes no trace counts and
+        # leaves the Long-Term Modulus graft below untouched.
+        E_terms, has_eq = _split_terms(tau_i, E_i, covariance)
+        sigma_log = sigma_log_coefficients(covariance)
+        plus, minus = spectrum_error_bars(
+            E_terms, sigma_log[1:] if has_eq else sigma_log)
+        spectrum_df["E_err_plus"] = plus
+        spectrum_df["E_err_minus"] = minus
+        error_kwargs = dict(error_y="E_err_plus", error_y_minus="E_err_minus")
     fig3 = px.scatter(
         spectrum_df, x="Time", y="E",
         log_x=True, log_y=True,
         color="Type", symbol="Type",
         labels={"Time": "Relaxation Time, 𝜏 (s)", "E": "Prony Coefficient, Eᵢ (Pa)"},
+        **error_kwargs,
     )
     if solid and E_i[0] > 0:
         fig3.add_trace(go.Scatter(
@@ -451,19 +617,34 @@ def _build_relaxation_figures(tau_i: np.ndarray, E_i: np.ndarray, N_nz: int,
     return fig2, fig3
 
 
-def _build_coef_records(tau_i: np.ndarray, E_i: np.ndarray) -> list:
+def _build_coef_records(tau_i: np.ndarray, E_i: np.ndarray,
+                        covariance: np.ndarray = None) -> list:
     """
     Build the Prony coefficient table as a list of records.
 
     Parameters:
         tau_i (numpy.ndarray): Prony relaxation times.
         E_i (numpy.ndarray): Prony coefficients (length tau_i or tau_i + 1).
+        covariance (numpy.ndarray): Posterior covariance of the fitted
+            log-coefficients, or None to omit the sigma column.
 
     Returns:
         list: List of dicts with keys 'i', 'tau_i', 'E_i' — one per nonzero
-        coefficient, with 'i' the original (pre-filter) index.
+        coefficient, with 'i' the original (pre-filter) index. With a
+        covariance, each record also carries 'sigma_log_E_i', the posterior
+        1-sigma of ln(E_i) in nepers, capped at _SIGMA_DISPLAY_CAP (a capped
+        value reads "unconstrained", and stays finite for the CSV export).
+        The column is omitted ENTIRELY when covariance is None, so the
+        NNLS/default path keeps its exact schema.
     """
-    coef_df = pd.DataFrame({"tau_i": tau_i, "E_i": E_i[len(E_i) - len(tau_i):]})
+    columns = {"tau_i": tau_i, "E_i": E_i[len(E_i) - len(tau_i):]}
+    if covariance is not None:
+        # Built BEFORE the nonzero filter below so rows stay aligned.
+        E_terms, has_eq = _split_terms(tau_i, E_i, covariance)
+        sigma_log = sigma_log_coefficients(covariance)
+        columns["sigma_log_E_i"] = np.minimum(
+            sigma_log[1:] if has_eq else sigma_log, _SIGMA_DISPLAY_CAP)
+    coef_df = pd.DataFrame(columns)
     coef_df = coef_df[coef_df.E_i != 0].reset_index(drop=False)
     coef_df = coef_df.rename(columns={'index': 'i'})
     return coef_df.to_dict("records")

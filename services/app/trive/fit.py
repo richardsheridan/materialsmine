@@ -22,6 +22,19 @@ from .reduction import _prony_reduce
 from .quality import _FitQuality, _prony_fit_quality
 
 
+# Decades of relaxation-time grid added past each end of the data window on
+# the smoothed path, so the fitted spectrum (and its uncertainty band) visibly
+# extrapolates instead of stopping dead at 1/omega_max and 1/omega_min. Purely
+# aesthetic — the value is a display-tuning knob, hardcoded after a screenshot
+# review, NOT a user-facing setting. The extension terms sit outside the data's
+# span, so the data cannot determine them: the smoothness penalty does (they
+# come out log-linear, level and slope inherited from the window edge via the
+# junction curvature), which is exactly the honesty the widening sigma band
+# reports. See _extended_relaxation_space for the sizing rules. Chosen from a
+# 1/2/3-decade screenshot review of the bundled files (user pick, 2026-08-27).
+_GRID_EXTENSION_DECADES = 1.0
+
+
 # Wall-clock budget for the Newton solve, in seconds. Legitimate solves run
 # on the reduced system — row-count independent, ~25 evaluations — and finish
 # in milliseconds across the whole 324-case benchmark grid, so 3 s is two to
@@ -144,6 +157,64 @@ def _newton_watchdog(budget: float):
         ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
 
 
+def _extended_relaxation_space(
+        tau_min: float,
+        tau_max: float,
+        N: int,
+        n_res: int,
+        solid: bool,
+        extension_decades: float,
+) -> tuple:
+    """
+    The fit grid widened by ~extension_decades per side at the in-window density.
+
+    Adds nodes BEYOND the window rather than stretching the user's N over a
+    wider span: the in-window node positions coincide with the unextended
+    prony_relaxation_space grid (to fp rounding — nothing may compare grids
+    bitwise), so extension changes what the fit reports outside the data, not
+    how it resolves inside it. The per-side count is
+    round(extension_decades / h_dec) with h_dec the in-window log10 spacing,
+    then capped so the whole fit keeps at least one degree of freedom:
+    headroom = n_res - 1 - solid - N is how many terms can still be added, and
+    each extension step costs two (one per side), so the cap is headroom // 2.
+    No extension at all when N < 2 (no spacing to inherit), when the span is
+    degenerate, or when there is no headroom — the caller then runs on exactly
+    the classic grid.
+
+    The cost of extending is carried where it is visible: dof drops by
+    2 * n_ext (shifting the sqrt(dof) in the penalty normalization), and the
+    penalty smooths the tail nodes along with the window. Both effects are a
+    few percent at ordinary sizes and are accepted — the alternative, a
+    separate penalty convention for tail terms, is exactly the kind of drift
+    the objective/quality split exists to prevent.
+
+    Parameters:
+        tau_min (float): Shortest in-window relaxation time (1 / max(omega)).
+        tau_max (float): Longest in-window relaxation time (1 / min(omega)).
+        N (int): User-requested number of in-window terms.
+        n_res (int): Residual count of the full problem (2 * len(omega)).
+        solid (bool): Whether the fit carries an equilibrium term.
+        extension_decades (float): Target widening per side, in decades.
+
+    Returns:
+        tuple: (tau_i, n_ext) — the grid (length N + 2 * n_ext) and the
+        per-side extension count actually applied.
+    """
+    log_min, log_max = np.log10(tau_min), np.log10(tau_max)
+    span_dec = log_max - log_min
+    if N < 2 or not (np.isfinite(span_dec) and span_dec > 0):
+        return prony_relaxation_space(tau_min, tau_max, N), 0
+    h_dec = span_dec / (N - 1)
+    headroom = n_res - 1 - solid - N
+    n_ext = min(int(round(extension_decades / h_dec)), max(0, headroom // 2))
+    if n_ext <= 0:
+        return prony_relaxation_space(tau_min, tau_max, N), 0
+    tau_i = np.logspace(
+        log_min - n_ext * h_dec, log_max + n_ext * h_dec, N + 2 * n_ext,
+    )
+    return tau_i, n_ext
+
+
 class _PlateauProjectedProblem:
     """
     The smoothed fit with the equilibrium (plateau) modulus projected out, so
@@ -238,6 +309,7 @@ def smooth_prony_fit(
         solid: bool = True,
         return_fit_quality: bool = False,
         std_scale: float = 1.0,
+        grid_extension_decades: float = None,
 ) -> tuple:
     """
     Fit a Prony series to complex-modulus data with coefficient smoothing.
@@ -322,11 +394,20 @@ def smooth_prony_fit(
             reduction so a caller that varies ONLY this factor — the
             relative-error widget — reuses one cached reduction across every
             value instead of redoing the O(rows) QR per move. See _prony_reduce.
+        grid_extension_decades (float): Test seam for the smoothed path's grid
+            extension: None (the default) uses _GRID_EXTENSION_DECADES, 0.0
+            disables extension entirely. Production callers never pass it —
+            the widening is an internal display decision, not a fit setting.
 
     Returns:
-        tuple: (tau_i, E_i) where tau_i is the 1-D relaxation-time grid of
-        length N and E_i is the 1-D non-negative coefficient array of length
-        N + bool(solid). Entries can be exactly zero (NNLS active set). With
+        tuple: (tau_i, E_i) where tau_i is the 1-D relaxation-time grid and
+        E_i is the 1-D non-negative coefficient array of length
+        len(tau_i) + bool(solid). On the unsmoothed path tau_i has exactly N
+        entries spanning 1/max(omega)..1/min(omega); on the smoothed path it
+        additionally carries ~_GRID_EXTENSION_DECADES decades of extension
+        nodes per side at the in-window density (see
+        _extended_relaxation_space), so its length is N + 2 * n_ext.
+        Entries can be exactly zero (NNLS active set). With
         return_fit_quality, (tau_i, E_i, quality); quality.neg_log_posterior is
         None unless the fit converged to an INTERIOR minimum with smoothing on,
         since the Laplace approximation behind it assumes a stationary point
@@ -334,7 +415,12 @@ def smooth_prony_fit(
         score is that of the N-term solid=False problem the solver actually
         converged on), and quality.curvature is None on the unsmoothed path,
         where the NNLS active set makes log-coefficients (and so their
-        roughness) undefined.
+        roughness) undefined. quality.covariance follows the same availability
+        as the Laplace machinery — the posterior covariance of the fitted
+        log-coefficients, None on the unsmoothed path or when the Hessian is
+        not positive definite; on the clamped-equilibrium path it covers the
+        N decaying log-coefficients only (no equilibrium row), matching the
+        problem the solver converged on.
     """
     assert isinstance(omega, np.ndarray) and omega.ndim == 1, \
         "omega must be a 1-D numpy.ndarray"
@@ -355,26 +441,24 @@ def smooth_prony_fit(
 
     tau_max = 1 / np.min(omega)
     tau_min = 1 / np.max(omega)
-    tau_i = prony_relaxation_space(tau_min, tau_max, N)
-
-    m = N + solid
     n_res = 2 * len(omega)
-    dof = n_res - m
-
-    R, z = _prony_reduce(
-        omega, E_stor, E_loss, E_stor_std, E_loss_std, tau_i, solid, std_scale
-    )
-    # (R, z) carries the unreachable orthogonal residual as its last row, which
-    # is what puts every score on the full-problem scale. nnls wants the full
-    # norm. The Newton solver would be indifferent — a constant row changes
-    # neither gradient nor Hessian, and trust-exact stops on the gradient, not
-    # on a relative reduction of f the way L-BFGS-B did — so the slice is now
-    # only about not carrying a dead row through every evaluation.
-    R_fit, z_fit = R[:m], z[:m]
 
     # Reduced problem with smoothness == 0 is exactly non-negative least
-    # squares — solve it directly (finite algorithm, no iteration budget).
+    # squares — solve it directly (finite algorithm, no iteration budget) on
+    # the EXACT unextended grid. The grid extension below is deliberately not
+    # applied here: with no penalty the tail terms would be pure numerical
+    # null space (nothing determines them, and the active set is not
+    # guaranteed to zero them), and no covariance exists to widen a band over
+    # the extrapolation. The visible consequence is an x-range jump when the
+    # smoothness slider crosses zero; that is honest, not a glitch.
     if smoothness == 0:
+        tau_i = prony_relaxation_space(tau_min, tau_max, N)
+        m = N + solid
+        dof = n_res - m
+        R, z = _prony_reduce(
+            omega, E_stor, E_loss, E_stor_std, E_loss_std, tau_i, solid,
+            std_scale,
+        )
         E_nnls, rnorm = nnls(R, z)
         if not return_fit_quality:
             return tau_i, E_nnls
@@ -387,13 +471,38 @@ def smooth_prony_fit(
             rnorm ** 2 / dof if dof > 0 else None, None, None,
         )
 
-    # smoothness > 0: the second-difference penalty acts on log-coefficients,
-    # so run Newton on the reduced system with the equilibrium term projected
-    # out. Normalize the knob so it means the same thing on any upload; see
+    # smoothness > 0: widen the grid a couple of decades past the data window
+    # (see _GRID_EXTENSION_DECADES) so the reported spectrum extrapolates,
+    # then run Newton on the reduced system with the equilibrium term
+    # projected out. Everything downstream — m, dof, the penalty
+    # normalization, the flat seed, the quality score — reads the EXTENDED
+    # quantities, so the extension terms are ordinary fit terms in every
+    # respect except that only the penalty determines them.
+    if grid_extension_decades is None:
+        grid_extension_decades = _GRID_EXTENSION_DECADES
+    tau_i, n_ext = _extended_relaxation_space(
+        tau_min, tau_max, N, n_res, solid, grid_extension_decades,
+    )
+    N_total = len(tau_i)
+    m = N_total + solid
+    dof = n_res - m
+
+    R, z = _prony_reduce(
+        omega, E_stor, E_loss, E_stor_std, E_loss_std, tau_i, solid, std_scale
+    )
+    # (R, z) carries the unreachable orthogonal residual as its last row, which
+    # is what puts every score on the full-problem scale. The Newton solver
+    # would be indifferent — a constant row changes neither gradient nor
+    # Hessian, and trust-exact stops on the gradient, not on a relative
+    # reduction of f the way L-BFGS-B did — so the slice is only about not
+    # carrying a dead row through every evaluation.
+    R_fit, z_fit = R[:m], z[:m]
+
+    # Normalize the knob so it means the same thing on any upload; see
     # _scaled_smoothness, which _prony_fit_quality re-derives from the same
     # inputs so the reported score belongs to the fit that was actually run.
     log_range = np.log(tau_i[-1] / tau_i[0])
-    smoothness_scaled = _scaled_smoothness(smoothness, N, dof, log_range)
+    smoothness_scaled = _scaled_smoothness(smoothness, N_total, dof, log_range)
     # No single Prony term above ~1000x the data maximum: the overflow guard
     # in _PronyLoss, same physical cap the old L-BFGS-B upper bound encoded.
     log_cap = np.log(E_stor.max()) + np.log(1e3)
@@ -404,7 +513,7 @@ def smooth_prony_fit(
         problem = _PronyLoss(z_fit, R_fit, smoothness_scaled, False, log_cap)
     # Flat seed, data-scaled: zero curvature, so the penalty contributes
     # nothing to the first step however large its weight.
-    x0 = np.full(N, np.log(E_stor.max() / m))
+    x0 = np.full(N_total, np.log(E_stor.max() / m))
     try:
         with _newton_watchdog(_NEWTON_TIME_BUDGET), \
                 np.errstate(over='ignore', invalid='ignore'):

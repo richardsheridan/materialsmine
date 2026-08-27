@@ -9,6 +9,7 @@ only caller; `figures._annotate_fit_quality` formats what comes out.
 from collections import namedtuple
 
 import numpy as np
+from scipy.linalg import cho_solve
 
 from .objective import (
     _log_curvature,
@@ -37,8 +38,23 @@ from .objective import (
 # DIFFERENCE: see _mean_sq_curvature for why the distinction decides whether
 # the number survives a change of N. Its square root is an RMS bend in nepers
 # per (ln tau)**2.
+#
+# covariance is the Laplace posterior covariance of the fitted
+# log-coefficients, Sigma = 2 * inv(Hess V) at the mode (the factor 2 because
+# the Gaussian likelihood is exp(-chi2/2) while V carries chi2; at lam -> 0 it
+# reduces exactly to the classical (J.T W J)^-1). It is conditional on the
+# error inputs and the smoothness setting — smoothing bias is NOT in it, so as
+# frequentist error bars its bands undercover the truth at strong smoothing;
+# consumers (uncertainty.py) present it as +/-1 sigma credible intervals given
+# those settings, not as calibrated coverage. None whenever neg_log_posterior
+# is (same Cholesky, same interior-minimum assumption) — its default keeps the
+# three-field construction sites valid. Row order matches the E_i the fit
+# returned: shape (len(E_i), ...) when the equilibrium term was a free
+# parameter (its log in row 0), shape (len(tau_i), ...) decaying-only on the
+# solid=False and clamped-equilibrium paths.
 _FitQuality = namedtuple(
-    '_FitQuality', 'chi2_reduced neg_log_posterior curvature'
+    '_FitQuality', 'chi2_reduced neg_log_posterior curvature covariance',
+    defaults=(None,),
 )
 
 
@@ -117,9 +133,11 @@ def _prony_fit_quality(
     — and it assumes logcoefs is a CONVERGED, INTERIOR minimum of V. At a
     non-stationary point the expansion has an unaccounted linear term.
 
-    Expects the QR-REDUCED system from smooth_prony_fit (basis=R, data=z), which
-    the route's N <= 100 cap bounds at ~102 rows; peak allocation is then two
-    m x m arrays. That system is already weighted by 1/std, so residuals here are
+    Expects the QR-REDUCED system from smooth_prony_fit (basis=R, data=z), whose
+    row count is m + 1 regardless of upload size — the route caps user N at 100
+    and the internal grid extension can add up to dof//2 tail terms on top, so
+    a couple hundred rows at the extreme; peak allocation is then a few m x m
+    arrays. That system is already weighted by 1/std, so residuals here are
     unweighted — see _prony_objective — and it carries the orthogonal residual
     the fit cannot reach as its own row, so both numbers come out on the
     full-problem scale and stay comparable across N with nothing to add back.
@@ -143,13 +161,17 @@ def _prony_fit_quality(
             curvature normalization. Also unavailable from the reduced system.
 
     Returns:
-        _FitQuality: (chi2_reduced, neg_log_posterior, curvature), all floats and
-        all "lower is better". chi2_reduced is None when the fit has no degrees
-        of freedom left; neg_log_posterior is None when the posterior is
-        undefined (no penalty, or fewer than 3 penalized terms) or when the
-        Laplace expansion does not apply (Hess V not positive definite, or
-        non-finite); curvature is None when fewer than 3 penalized terms leave
-        no second difference to take. The two reported quantities are means —
+        _FitQuality: (chi2_reduced, neg_log_posterior, curvature, covariance);
+        the first three floats, all "lower is better". chi2_reduced is None
+        when the fit has no degrees of freedom left; neg_log_posterior is None
+        when the posterior is undefined (no penalty, or fewer than 3 penalized
+        terms) or when the Laplace expansion does not apply (Hess V not
+        positive definite, or non-finite); curvature is None when fewer than 3
+        penalized terms leave no second difference to take. covariance is the
+        m x m Laplace posterior covariance 2 * inv(Hess V) of logcoefs (see
+        the _FitQuality header), None exactly when there is no penalty or no
+        positive-definite Hessian — but NOT gated on the npen >= 3 posterior
+        condition. The two reported quantities are means —
         chi-squared per degree of freedom, squared log-spectrum curvature per
         unit ln(tau) — while the algebra below works in raw sums, so every
         normalization happens once, at the single return.
@@ -179,17 +201,34 @@ def _prony_fit_quality(
     # exists, including at smoothness == 0 where there is no posterior.
     curve = _log_curvature(logcoefs, solid)
 
-    # No penalty (lam = 0 -> log(lam) = -inf) or too few penalized terms for a
-    # second difference to exist means there is no prior on lam to be posterior
-    # about. npen < 3 would also reach log(npen - 1) = log(0) below.
+    # No penalty (lam = 0 -> log(lam) = -inf) means neither a posterior over
+    # lam nor a Laplace covariance: the unsmoothed path is NNLS, whose active
+    # set pins coefficients at exact zeros where log-space has no curvature.
     neg_log_posterior = None
-    if len(curve) and smoothness:
-        # Note V is NOT a marginal likelihood: it is the unnormalized negative
-        # log JOINT density at the mode (misfit+penalty). hess() returns a
-        # fresh array, so nothing cached is at stake in the factorization.
-        V = loss.fun(logcoefs)
+    covariance = None
+    if smoothness:
+        # hess() returns a fresh array, so nothing cached is at stake in the
+        # factorization.
         chol = _cholesky_or_none(loss.hess(logcoefs))
         if chol is not None:
+            # Sigma = 2 * inv(Hess V): the Laplace posterior covariance of the
+            # log-coefficients (see the _FitQuality header for semantics).
+            # Deliberately NOT gated on len(curve): a fit with npen < 3 has an
+            # identically-zero penalty but still a data-determined curvature,
+            # so its Sigma is well defined even though the lam posterior below
+            # is not. cho_solve keeps the inverse consistent with the same
+            # factor the log-determinant uses; re-symmetrize to scrub the
+            # triangular solve's rounding before consumers take Cholesky
+            # factors or eigenvalues of it.
+            covariance = cho_solve((chol, True), 2.0 * np.eye(m))
+            covariance = 0.5 * (covariance + covariance.T)
+        # Too few penalized terms for a second difference to exist means there
+        # is no prior on lam to be posterior about. npen < 3 would also reach
+        # log(npen - 1) = log(0) below.
+        if chol is not None and len(curve):
+            # Note V is NOT a marginal likelihood: it is the unnormalized
+            # negative log JOINT density at the mode (misfit+penalty).
+            V = loss.fun(logcoefs)
             logdet_hess = 2 * np.log(np.diag(chol)).sum()
             logpdetA = (
                 2 * np.log(npen) + np.log(npen - 1) + np.log(npen + 1)
@@ -213,4 +252,5 @@ def _prony_fit_quality(
         chi2 / dof if dof > 0 else None,
         neg_log_posterior,
         _mean_sq_curvature(curve, npen, log_range),
+        covariance,
     )
