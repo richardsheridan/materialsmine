@@ -59,6 +59,17 @@
           that each point is weighted by σ = (relative error ÷ 100) × |E*|.
         </p>
         <p>
+          When smoothing is on, the fitted curves carry shaded ±1σ bands (and the spectrum dots
+          carry error bars) derived from the curvature of the fit's objective at its optimum.
+          Read them as credible intervals <em>given</em> the error inputs and the smoothness
+          setting: they say how well those settings pin down the fit, not how far the fit may sit
+          from the truth. Smoothing bias is not included, so at strong smoothing the true curve
+          can fall outside the band more often than the label suggests. The relaxation-time grid
+          also extends a couple of decades past your data on the smoothed path; there the bands
+          widen sharply because only the smoothness prior — not your data — constrains the
+          extrapolation.
+        </p>
+        <p>
           Time–temperature superposition (TTSP) provides the temperature axis. Tri-VE supports
           three shift-factor models: <strong>WLF</strong> (with T<sub>g</sub> in °C,
           C<sub>1</sub>, and C<sub>2</sub> either entered or estimated from your data),
@@ -94,7 +105,8 @@
           moduli, not a fraction or a percent. If E' is 1e9 Pa, a 5% uncertainty is
           <strong>5e7</strong>, not 0.05. Every error value must be greater than zero. Error
           columns set the fit weights (1/σ), and the Relative Error setting becomes an Error
-          Scale that multiplies them; they are not drawn as error bars.
+          Scale that multiplies them; they are not drawn on the experimental points themselves,
+          but they feed the ±1σ bands drawn around the fit.
         </p>
         <p>
           A manual shift-factor file, if you use one, is two columns: temperature in °C and
