@@ -58,6 +58,7 @@ from app.trive.fit import (
     SmoothPronyFitTimeout,
 )
 from app.trive.calibration import argmax_peak
+from ._route_helpers import REAL_FILES_DIR
 from app.trive.figures import _build_coef_records
 
 
@@ -2056,6 +2057,55 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         r0 = basis[:, 0]
         resid = data - basis[:, 1:] @ E_i[1:]
         np.testing.assert_allclose(E_i[0], (r0 @ resid) / (r0 @ r0), rtol=1e-8)
+
+    def test_chi2_reduced_is_invariant_to_grid_size_once_data_is_resolved(self):
+        # chi2_reduced divides by n - gamma - 1, gamma being MacKay's
+        # effective number of decaying terms (plus 1 for the free equilibrium
+        # term). Once N is past what the data resolves, gamma saturates and
+        # the fit stops changing, so the score must stop moving with N: the
+        # readout is then a property of the DATA and the smoothing, not of
+        # the grid the user happened to pick. The former n - m denominator
+        # counted every grid node (extension nodes included) as a parameter
+        # and drifted 7% over this range — the regression this pins. Real
+        # data, not the noise-free synthetic fixtures: with no noise floor
+        # the misfit itself keeps falling with N and neither denominator is
+        # invariant. Measured 2026-09-04 (n_resid 1008, cap 89, resolution
+        # ~21): gamma 22.8 / 21.7 / 21.3 and chi2_reduced within 0.04% at
+        # N = 32 / 48 / 89, against 0.931 / 0.950 of the cap's value under
+        # n - m; 1% is ~25x the pass-side spread and 5x inside the failure.
+        # Weak-to-moderate smoothing only: at smoothness >= 0.4 the strongly
+        # smoothed fit itself still changes with N on some bundled files.
+        data = np.loadtxt(
+            os.path.join(REAL_FILES_DIR, 'agilus30 (8) master curve 20C.txt'),
+            delimiter='\t',
+        )
+        omega, E_stor, E_loss = data[:, 0], data[:, 1], data[:, 2]
+        std = np.abs(E_stor + 1j * E_loss) * 0.01
+        smoothness = 0.1
+        max_prony, _ = prony_rank_limits(
+            omega, E_stor, E_loss, std, std, solid=True)
+        self.assertGreaterEqual(max_prony, 64)
+        sizes = (32, 48, max_prony)
+        scores = {}
+        for N in sizes:
+            tau_i, E_i, quality = smooth_prony_fit(
+                omega, E_stor, E_loss, E_stor_std=std, E_loss_std=std,
+                N=N, smoothness=smoothness, solid=True,
+                return_fit_quality=True,
+            )
+            # Precondition of the claim: every N here is past what the data
+            # resolves, so gamma has room to saturate.
+            resolution = prony_resolution(
+                omega, E_stor, E_loss, std, std, tau_i, E_i, smoothness,
+                solid=True,
+            )
+            self.assertLess(resolution, N)
+            self.assertIsNotNone(quality.effective_terms)
+            scores[N] = quality.chi2_reduced
+        reference = scores[max_prony]
+        for N in sizes[:-1]:
+            with self.subTest(N=N):
+                self.assertAlmostEqual(scores[N] / reference, 1.0, delta=0.01)
 
     def test_effective_terms_never_exceed_the_isotropic_prior_ceiling(self):
         # The fit's own gamma against prony_rank_limits' noise_prony, at the
