@@ -41,7 +41,10 @@ _GRID_EXTENSION_DECADES = 1.0
 # three orders of magnitude of headroom, while surfacing a runaway solve as
 # this module's actionable 400 well before the gunicorn worker's 60 s
 # request timeout SIGKILLs it into an opaque 500 (observed 2026-08-25; see
-# _newton_watchdog).
+# _newton_watchdog). Known to be approached by LEGITIMATE solves: weak
+# smoothing (0.004) with N near the numerical-rank cap on a broadband file
+# (agilus) takes ~500 Newton iterations, 2.5-3 s (measured 2026-09-04) — a
+# budget trip there is a slow solve, not a hang, and is out of scope here.
 _NEWTON_TIME_BUDGET = 3.0
 
 
@@ -52,6 +55,19 @@ class SmoothPronyFitTimeout(ValueError):
     a 400 whose message reaches the user's snackbar verbatim — this is an
     input-driven condition (the requested grid size, against this data) with
     a user-side remedy, not a server fault.
+    """
+
+
+class SmoothPronyFitDiverged(ValueError):
+    """scipy raised on a non-finite array inside the Newton solve.
+
+    scipy 1.10.1's trust-exact subproblem can raise
+    ValueError("array must not contain infs or NaNs") from its own cho_solve
+    when its damping iteration goes non-finite (observed at N=108 with the
+    grid extension off, past the route's own cap). A ValueError for the same
+    reason SmoothPronyFitTimeout is one: the routes' except-ValueError arm
+    turns it into a 400 whose message names a user-side remedy, instead of
+    the opaque 500 scipy's own text would become.
     """
 
 
@@ -83,15 +99,18 @@ class _NewtonBudgetExceeded(BaseException):
 # then delete _newton_watchdog, _NewtonBudgetExceeded, _NEWTON_TIME_BUDGET
 # and the contextlib/ctypes/threading imports, and replace
 # TestNewtonWatchdog's mechanism tests with a maxiter-exhaustion test (a
-# tiny 'maxiter' against the known-pathological fixture in
-# TestPronyRankLimits.test_cap_counts_sqrt_eps_not_eps). Two things do NOT
-# retire with it: never return the capped result even though it is often
-# near-converged (it would silently break the ~1e-13 reproducibility
-# contract that makes coefficient diffs meaningful), and never drop the
-# sqrt(eps) cap in prony_rank_limits — scipy's caps restore liveness, not
-# determinability. Upstream wart to watch when bumping: the capped
-# subproblem can exit with `p` unbound if every pass fails factorization
-# (UnboundLocalError, scipy main as of 2026-08-25).
+# tiny 'maxiter' against the zero-eigenvalue fixture in
+# TestNewtonHessianShift, with _NEWTON_HESSIAN_SHIFT_EPS patched to 0).
+# Three things do NOT retire with it: never return the capped result even
+# though it is often near-converged (it would silently break the ~1e-13
+# reproducibility contract that makes coefficient diffs meaningful); keep
+# _NEWTON_HESSIAN_SHIFT_EPS (a capped subproblem on an exactly singular
+# Hessian is a degraded step, not a correct one); and leave the max_prony
+# cap in reduction.prony_rank_limits alone — it marks where extra grid
+# columns become redundant and has nothing to do with liveness. Upstream
+# wart to watch when bumping: the capped subproblem can exit with `p`
+# unbound if every pass fails factorization (UnboundLocalError, scipy main
+# as of 2026-08-25).
 @contextlib.contextmanager
 def _newton_watchdog(budget: float):
     """
@@ -100,15 +119,26 @@ def _newton_watchdog(budget: float):
 
     Why this exists: scipy's trust-exact subproblem solver
     (_trustregion_exact.IterativeSubproblem.solve) is a `while True` whose
-    every exit path requires a Moré-Sorensen stop inequality to hold, and at
-    Hessian condition ~1/eps those inequalities can be unsatisfiable in
-    float64 — the lambda iteration then cycles forever (`self.niter` is
-    counted but never checked, so minimize's maxiter cannot help: the outer
-    loop never gets control back). Observed 2026-08-25 on a noise-free
-    synthetic 2-decade file at N within a few terms of the eps-rank: 88
-    subproblems solved in microseconds, the 89th still spinning at 120 s,
-    with the gradient already down 7 decades — the fit was done, the solver
-    just could not certify its last step.
+    every exit path requires a Moré-Sorensen stop inequality to hold, and
+    when the Hessian has an EXACTLY zero eigenvalue those inequalities can be
+    unsatisfiable in float64 — the lambda iteration then cycles forever
+    (`self.niter` is counted but never checked, so minimize's maxiter cannot
+    help: the outer loop never gets control back). Observed 2026-08-25 on a
+    noise-free synthetic 2-decade file: 88 subproblems solved in
+    microseconds, the 89th still spinning at 120 s, with the gradient
+    already down 7 decades — the fit was done, the solver just could not
+    certify its last step. The zero eigenvalue was traced (2026-09-04) to a
+    direction that is BOTH in the smoothness penalty's null space (a
+    log-linear ramp of the log-coefficients has zero second difference) AND
+    invisible to the data (that file is a single Debye at the long-tau end
+    of the window with no mass elsewhere, so the ramp runs the remaining
+    coefficients down to ~1e-150): a flat valley the subproblem cannot
+    bracket. It reproduced at N = 14, 18, 20 on a 2-decade window whose
+    numerical-rank cap is 21 — the cap in reduction.prony_rank_limits never
+    was the guard and is not documented as one. _NEWTON_HESSIAN_SHIFT_EPS
+    lifts that eigenvalue off zero for the solver and removed every
+    reproduced case; this watchdog stays as the wall-clock policy boundary,
+    and also catches legitimately slow solves.
 
     Upstream knows: scipy gh-12513 ("Halting problem in trust-exact
     subproblem", open since 2020) was closed by capping that loop at 25
@@ -118,9 +148,8 @@ def _newton_watchdog(budget: float):
     pinned to (last release supporting Python 3.8) and a plausible driver of
     the observed cycling. If the stack ever moves past 3.8, scipy >= 1.17
     turns a runaway subproblem into a degraded step instead of a hang and
-    this watchdog becomes belt-and-suspenders; it should stay regardless,
-    since the capped subproblem still cannot make N beyond the sqrt(eps)
-    rank meaningful (see reduction.prony_rank_limits).
+    this watchdog becomes belt-and-suspenders; it should stay regardless, as
+    the wall-clock policy boundary.
 
     Mechanism: a daemon Timer thread calls PyThreadState_SetAsyncExc on this
     thread's id, which schedules the exception at the next bytecode boundary.
@@ -155,6 +184,60 @@ def _newton_watchdog(budget: float):
     finally:
         timer.cancel()
         ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+
+
+# Levenberg-style shift applied to the SOLVER's Hessian only, in units of the
+# Hessian array's own machine epsilon (64 * eps: 1.4e-14 for float64). The
+# exact Hessian is untouched — quality._prony_fit_quality builds its own
+# _PronyLoss and factors that for the covariance and the evidence — so the
+# objective, its gradient, the optimum and the reported uncertainty are all
+# exactly what they were; only the Newton STEP is computed from H + shift * I.
+# Why: see _newton_watchdog — an exactly-zero Hessian eigenvalue (a
+# penalty-null, data-invisible direction) sends scipy 1.10.1's Moré-Sorensen
+# loop into a cycle. Shifting the diagonal by a rounding-level amount gives
+# that direction a representable curvature, so the Cholesky-based path of the
+# subproblem applies and the zero-gradient direction simply gets a zero step.
+# Measured 2026-09-04 (scale = max|diag H|): 1e-14 and 1e-13 removed every
+# reproduced hang (N = 14..43, smoothness 0.04 / 0.4 / 1.0, extension off)
+# for 10-20% more Newton iterations, and moved real-file solutions by
+# <= 8e-8 in log E (relative chi2 <= 5e-12, i.e. inside the gradient
+# tolerance's own basin); 1e-12 doubled the iteration count, 1e-10 and above
+# cost 3-50x and drifted visibly. Expressed in eps rather than as a bare
+# 1e-14 because scipy factors whatever dtype it is handed
+# (IterativeSubproblem picks LAPACK potrf by the array's dtype, no upcast):
+# the same margin above a float32 rounding floor is 64 * 1.2e-7. Every path
+# today builds the Hessian in float64 (prony_basis allocates float64 and the
+# QR reduction keeps it), so that branch is future-proofing, not a tested
+# regime. Read at call time so tests can patch it to 0 for an unshifted
+# reference.
+_NEWTON_HESSIAN_SHIFT_EPS = 64
+
+
+def _shifted_hessian(hess, eps_multiple: float):
+    """
+    Wrap a Hessian callable so the solver sees H + eps_multiple * eps * max|diag H| * I.
+
+    eps is the machine epsilon of the array `hess` returns, so the shift is a
+    fixed number of ulps of the Hessian's largest diagonal entry whatever the
+    precision. `hess` must return a FRESH array per call — both
+    _PronyLoss.hess and _PlateauProjectedProblem.hess do — since the shift
+    is applied in place. eps_multiple == 0 returns hess's output untouched.
+
+    Parameters:
+        hess (callable): logcoefs -> fresh (m, m) Hessian array.
+        eps_multiple (float): Shift in units of the array's machine epsilon.
+
+    Returns:
+        callable: logcoefs -> the shifted Hessian, for minimize's hess=.
+    """
+    def shifted(logcoefs: np.ndarray) -> np.ndarray:
+        H = hess(logcoefs)
+        if eps_multiple:
+            shift = (eps_multiple * np.finfo(H.dtype).eps
+                     * np.abs(np.diag(H)).max())
+            np.einsum('ii->i', H)[...] += shift
+        return H
+    return shifted
 
 
 def _extended_relaxation_space(
@@ -356,15 +439,25 @@ def smooth_prony_fit(
     (an unbounded `while True` in scipy that maxiter cannot cap) while BFGS
     overflowed to NaN. Do not reintroduce it.
 
-    The flat seed does not make that loop unreachable, only rare: with N
-    within a few terms of the data's eps-rank on effectively noise-free data,
-    the near-converged Hessian's condition reaches ~1/eps and the subproblem's
-    stop inequalities become unsatisfiable in float64 (observed 2026-08-25,
-    hung past 120 s with the gradient already down 7 decades). The solve
-    therefore runs under _newton_watchdog, which converts a run past
+    The flat seed does not make that loop unreachable: when the data has no
+    mass over part of the grid and the penalty's null space (a log-linear
+    ramp) can run those coefficients toward -inf at zero cost, the converged
+    Hessian carries an exactly-zero eigenvalue and the subproblem's stop
+    inequalities become unsatisfiable in float64 (observed 2026-08-25 on a
+    noise-free single-Debye file, hung past 120 s with the gradient already
+    down 7 decades; reproduced 2026-09-04 well below the numerical-rank cap,
+    which is not a guard against it). Two layers handle that. The Hessian
+    handed to scipy is shifted by _NEWTON_HESSIAN_SHIFT_EPS ulps of its
+    largest diagonal entry (see _shifted_hessian) — a Levenberg-style
+    numerical regularization of the STEP only, never of the objective, the
+    gradient, or the scored Hessian — which removed every reproduced hang at
+    a cost of 10-20% more iterations and <= 8e-8 in log E. And the solve
+    runs under _newton_watchdog, which converts a run past
     _NEWTON_TIME_BUDGET into SmoothPronyFitTimeout — a ValueError, so the
     routes answer 400 with the actionable message instead of the gunicorn
-    worker being killed into an opaque 500.
+    worker being killed into an opaque 500. A ValueError raised from inside
+    scipy's own machinery (its 1.10.1 subproblem can go non-finite) is
+    re-raised the same way as SmoothPronyFitDiverged.
 
     Parameters:
         omega (numpy.ndarray): 1-D array of angular frequencies.
@@ -521,17 +614,26 @@ def smooth_prony_fit(
                 fun=problem.fun,
                 x0=x0,
                 jac=problem.jac,
-                hess=problem.hess,
+                hess=_shifted_hessian(problem.hess, _NEWTON_HESSIAN_SHIFT_EPS),
                 method='trust-exact',
             )
     except _NewtonBudgetExceeded:
         raise SmoothPronyFitTimeout(
             f"The fit did not converge within {_NEWTON_TIME_BUDGET:.0f} "
-            f"seconds at a relaxation grid size of {N}. Grid sizes near the "
-            f"limit of what the data's span and precision can determine can "
-            f"trap the solver — lower the relaxation grid size, or raise "
-            f"the smoothness or the assumed error."
+            f"seconds at a relaxation grid size of {N} — lower the "
+            f"relaxation grid size, or raise the smoothness or the assumed "
+            f"error."
         ) from None
+    except ValueError as exc:
+        # scipy 1.10.1's subproblem can raise "array must not contain infs
+        # or NaNs" from its own cho_solve when its damping iteration goes
+        # non-finite (observed at N=108 with the grid extension off). Same
+        # 400 path as the timeout, with a message that names a remedy.
+        raise SmoothPronyFitDiverged(
+            f"The fit broke down (non-finite values inside the solver) at a "
+            f"relaxation grid size of {N} — lower the relaxation grid size, "
+            f"or raise the smoothness or the assumed error."
+        ) from exc
     # result.success is deliberately not consulted: near the optimum the
     # trust radius can collapse on a precision-limited reduction ratio and
     # scipy reports "bad approximation" with the gradient already ~1e-5.

@@ -45,7 +45,9 @@ from app.trive.fit import (
     _newton_watchdog,
     _NewtonBudgetExceeded,
     _extended_relaxation_space,
+    _shifted_hessian,
     _GRID_EXTENSION_DECADES,
+    SmoothPronyFitDiverged,
     SmoothPronyFitTimeout,
 )
 from app.trive.calibration import argmax_peak
@@ -1165,6 +1167,25 @@ class TestPronyReduce(unittest.TestCase):
         )
 
 
+def _single_debye_master(decades, n_per_decade=30):
+    """
+    A noise-free single Debye relaxation (tau = 1) over `decades` of frequency
+    starting at omega = 1, i.e. sitting exactly at the LONG-tau end of the fit
+    window with no spectral mass anywhere else, plus a small equilibrium
+    plateau. Enough structure that the weighted basis is a realistic probe
+    target (TestPronyRankLimits), and pathological in a specific, useful way:
+    on the classic (unextended) grid the smoothed fit's log-coefficients form
+    a linear ramp away from the peak that neither the penalty nor the data
+    can see, which is the exactly-zero Hessian eigenvalue behind scipy's
+    subproblem hang (TestNewtonHessianShift).
+    """
+    omega = np.logspace(0.0, decades, max(60, int(n_per_decade * decades)))
+    E_stor = 1e3 + 1e6 * omega ** 2 / (1 + omega ** 2)
+    E_loss = 1e6 * omega / (1 + omega ** 2) + 1e2
+    std = np.abs(E_stor + 1.0j * E_loss)
+    return omega, E_stor, E_loss, std
+
+
 class TestPronyRankLimits(unittest.TestCase):
     """The SVD rank probe: term-count ceilings from precision and noise."""
 
@@ -1173,14 +1194,7 @@ class TestPronyRankLimits(unittest.TestCase):
 
     @staticmethod
     def _master(decades, n_per_decade=30):
-        # A single broad transition sampled over the requested span — enough
-        # structure that the weighted basis is a realistic probe target, with
-        # no fixture file to load.
-        omega = np.logspace(0.0, decades, max(60, int(n_per_decade * decades)))
-        E_stor = 1e3 + 1e6 * omega ** 2 / (1 + omega ** 2)
-        E_loss = 1e6 * omega / (1 + omega ** 2) + 1e2
-        std = np.abs(E_stor + 1.0j * E_loss)
-        return omega, E_stor, E_loss, std
+        return _single_debye_master(decades, n_per_decade)
 
     def _limits(self, decades=4, **overrides):
         omega, E_stor, E_loss, std = self._master(decades)
@@ -2038,8 +2052,10 @@ class TestNewtonWatchdog(unittest.TestCase):
     """
     The wall-clock guard around the trust-exact solve.
 
-    scipy's subproblem loop can cycle forever at Hessian condition ~1/eps
-    (see fit._newton_watchdog); these tests exercise the guard against a
+    scipy's subproblem loop can cycle forever on an exactly-zero Hessian
+    eigenvalue (see fit._newton_watchdog; fit._NEWTON_HESSIAN_SHIFT_EPS
+    removes the reproduced cases and this guard stays as the backstop);
+    these tests exercise the guard against a
     deterministic pure-Python stand-in for that loop rather than the real
     hang, which is data- and BLAS-dependent and takes the full budget by
     definition. The stand-ins spin in Python (not time.sleep) because the
@@ -2097,6 +2113,81 @@ class TestNewtonWatchdog(unittest.TestCase):
         # with the message intact; losing the subclassing would demote it to
         # the generic 500 path.
         self.assertTrue(issubclass(SmoothPronyFitTimeout, ValueError))
+
+
+class TestNewtonHessianShift(unittest.TestCase):
+    """
+    The rounding-level diagonal shift on the SOLVER's Hessian
+    (fit._NEWTON_HESSIAN_SHIFT_EPS via fit._shifted_hessian).
+
+    The fixture is the one that exposed scipy's subproblem hang:
+    _single_debye_master(2) on the classic (unextended) grid. Its converged
+    log-coefficients form a linear ramp the penalty cannot see and the data
+    cannot see, so the Hessian has an exactly-zero eigenvalue. Timeouts
+    reproduced on 2026-09-04 at N = 14, 18, 20, 22, 28 (smoothness 0.4) and
+    37, 43 (0.04) — below AND above the numerical-rank cap of 21 for that
+    window, which is why the cap is not the guard and this shift is.
+    """
+
+    def test_shift_adds_exactly_the_scaled_identity(self):
+        rng = np.random.default_rng(3)
+        basis, data, x = _converged_fit_problem(rng, N=6, smoothness=1.0)
+        loss = _PronyLoss(data, basis, 1.0, True)
+        H = loss.hess(x)
+        shifted = _shifted_hessian(loss.hess, 1e10)(x)
+        expected = 1e10 * np.finfo(H.dtype).eps * np.abs(np.diag(H)).max()
+        np.testing.assert_allclose(
+            shifted - H, expected * np.eye(len(H)),
+            rtol=0, atol=1e-6 * expected)
+        # A zero multiple is a passthrough, bit for bit.
+        np.testing.assert_array_equal(_shifted_hessian(loss.hess, 0)(x), H)
+        # The shift follows the ARRAY's precision, not float64's: scipy
+        # factors whatever dtype it is handed.
+        H32 = np.eye(3, dtype=np.float32) * np.float32(4.0)
+        out = _shifted_hessian(lambda _x: H32.copy(), 1.0)(x)
+        self.assertEqual(out.dtype, np.float32)
+        np.testing.assert_allclose(
+            np.diag(out) - np.float32(4.0),
+            4.0 * np.finfo(np.float32).eps, rtol=1e-3)
+
+    def test_zero_eigenvalue_fixture_solves_with_extension_off(self):
+        # Without the shift every one of these trips the 3 s watchdog
+        # (verified red before the shift landed). With it, milliseconds.
+        omega, E_stor, E_loss, std = _single_debye_master(2)
+        for N, smoothness in ((14, 0.4), (20, 0.4), (37, 0.04), (22, 1.0)):
+            with self.subTest(N=N, smoothness=smoothness):
+                tau_i, E_i = smooth_prony_fit(
+                    omega, E_stor, E_loss, std, std, N=N,
+                    smoothness=smoothness, solid=True, std_scale=0.01,
+                    grid_extension_decades=0.0)
+                self.assertEqual(len(tau_i), N)
+                self.assertTrue(np.all(np.isfinite(E_i)))
+
+    def test_shift_leaves_a_real_fit_unchanged(self):
+        # The shift changes the Newton STEP, not the objective, so a
+        # well-posed fit converges to the same optimum within the gradient
+        # tolerance's basin (measured <= 8e-8 in log E on the bundled files).
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        kwargs = dict(N=30, smoothness=0.1, solid=True)
+        _, shifted = smooth_prony_fit(omega, E_stor, E_loss, std, std, **kwargs)
+        with mock.patch.object(prony_fit, '_NEWTON_HESSIAN_SHIFT_EPS', 0):
+            _, exact = smooth_prony_fit(omega, E_stor, E_loss, std, std, **kwargs)
+        self.assertLess(
+            np.abs(np.log(shifted[1:]) - np.log(exact[1:])).max(), 1e-6)
+
+    def test_scipy_value_error_becomes_actionable(self):
+        # scipy 1.10.1 can raise its own ValueError from inside the
+        # subproblem; it must surface as the actionable 400, with the
+        # original chained for the logs.
+        omega, E_stor, E_loss, std = _single_debye_master(2)
+        boom = ValueError('array must not contain infs or NaNs')
+        with mock.patch.object(prony_fit, 'minimize', side_effect=boom):
+            with self.assertRaises(SmoothPronyFitDiverged) as caught:
+                smooth_prony_fit(omega, E_stor, E_loss, std, std,
+                                 N=8, smoothness=0.04, std_scale=0.01)
+        self.assertIn('relaxation grid size of 8', str(caught.exception))
+        self.assertIs(caught.exception.__cause__, boom)
+        self.assertTrue(issubclass(SmoothPronyFitDiverged, ValueError))
 
 
 class TestArgmaxPeak(unittest.TestCase):
