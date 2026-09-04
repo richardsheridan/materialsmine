@@ -273,7 +273,15 @@ def prony_rank_limits(
         terms: no particular Prony term is the identifiable one. Kept on the
         wire for clients; it no longer drives a caption — the grid-size
         suggestion measures against prony_resolution on both fit paths.
-        Unclipped and including the equilibrium column.
+        Unclipped and including the equilibrium column. Its one internal
+        use is as a CONSISTENCY BOUND: prony_resolution (both paths) and
+        the fit's own quality.effective_terms never exceed it. That is not
+        a theorem — the smoothing prior acts in log space at the fit and
+        leaves its constant and ramp null directions free, the isotropic
+        box acts in linear space at the flat seed, so the two are not
+        nested — but it held with a >= 2x margin over every fixture and
+        bundled file at every smoothness and error level tried, and the
+        tests assert it.
 
     Parameters:
         omega (numpy.ndarray): 1-D array of angular frequencies.

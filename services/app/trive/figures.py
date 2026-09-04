@@ -202,6 +202,8 @@ def _annotate_fit_quality(figs, quality) -> None:
     All three numbers are "lower is better". Fields that are None are omitted,
     so an unsmoothed fit shows the misfit alone (with no smoothing there is
     neither a posterior over the smoothing weight nor a defined roughness).
+    The nu in chi2/nu is the EFFECTIVE degrees of freedom on the smoothed
+    path (quality.effective_terms), the classical count on the unsmoothed one.
     Curvature sits in the middle, next to chi-squared: those two are the L-curve
     coordinates a user trades off when sweeping the smoothness slider.
 

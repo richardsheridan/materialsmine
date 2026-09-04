@@ -366,7 +366,10 @@ def _dense_fit_quality(logcoefs, data, basis, smoothness, solid,
     UNSCALED smoothness the production function does, and re-derives the
     sqrt(dof / h**3) normalization independently rather than importing it.
     Returns (chi2, neg_log_posterior) with the posterior None exactly when C is
-    not positive definite, matching the contract.
+    not positive definite, matching the contract. chi2 is per EFFECTIVE degree
+    of freedom whenever C is positive definite — n_resid minus MacKay's gamma
+    over the penalized terms, minus one for the free equilibrium term — and
+    per classical degree of freedom otherwise, again matching the contract.
 
     prior_lam exists only here, so one test can show that production charges the
     exponential prior at the unscaled knob rather than at the scaled weight; the
@@ -389,9 +392,12 @@ def _dense_fit_quality(logcoefs, data, basis, smoothness, solid,
     V = resid @ resid + lam * (logcoefs @ A @ logcoefs)
     J = -(basis * coefs)
     C = lam * A + J.T @ J + np.diag(resid @ J)
-    chi2 = (resid @ resid) / dof if dof > 0 else None
+    rr = resid @ resid
     if np.linalg.eigvalsh(C).min() <= 0:
-        return chi2, None
+        return (rr / dof if dof > 0 else None), None
+    gamma = npen - lam * np.trace(A @ np.linalg.inv(C))
+    nu = n_resid - gamma - solid
+    chi2 = rr / nu if nu > 0 else None
     eigs = np.linalg.eigvalsh(A)
     nonzero = eigs > eigs.max() * 1e-10
     neg_log_posterior = (
@@ -760,10 +766,37 @@ class TestPronyFitQuality(unittest.TestCase):
             np.log(truth), z, R, 1.0, True, n_resid=n_resid, log_range=LOG_RANGE,
         )
         resid = (y - clean) / std
-        expected = resid @ resid / (n_resid - len(truth))
+        # The denominator is the effective count (gamma + the free
+        # equilibrium term), taken from the same scoring; the numerator is
+        # what this test is about.
+        expected = resid @ resid / (n_resid - (quality.effective_terms + 1))
         self.assertAlmostEqual(
             quality.chi2_reduced, expected, delta=1e-9 * expected,
         )
+
+    def test_chi2_is_per_effective_degree_of_freedom(self):
+        # The denominator is n_resid - (gamma + 1): the decaying terms count
+        # for what the data determined of them, the free equilibrium term for
+        # exactly one. The classical n_resid - m charges every penalty-pinned
+        # term as if the data had paid for it, leaving fewer residuals, so
+        # it reads HIGH. Without a penalty there is no gamma and the
+        # classical count stands.
+        basis, data, x = _converged_fit_problem(self.rng, N=10, smoothness=1.0)
+        n_resid = 2 * len(data)
+        quality = _prony_fit_quality(
+            x, data, basis, 1.0, True, n_resid=n_resid, log_range=LOG_RANGE,
+        )
+        rr = (data - basis @ np.exp(x)) @ (data - basis @ np.exp(x))
+        nu = n_resid - (quality.effective_terms + 1)
+        self.assertLess(quality.effective_terms, 10.0)
+        self.assertAlmostEqual(quality.chi2_reduced * nu, rr, delta=1e-9 * rr)
+        self.assertLess(quality.chi2_reduced, rr / (n_resid - 11))
+        raw = _prony_fit_quality(
+            x, data, basis, 0.0, True, n_resid=n_resid, log_range=LOG_RANGE,
+        )
+        self.assertIsNone(raw.effective_terms)
+        self.assertAlmostEqual(raw.chi2_reduced, rr / (n_resid - 11),
+                               delta=1e-9 * raw.chi2_reduced)
 
     def test_prior_is_charged_on_the_unscaled_knob(self):
         # lam in the Laplace expansion is the SCALED weight, but the exponential
@@ -830,9 +863,16 @@ class TestPronyFitQuality(unittest.TestCase):
 
     def test_chi2_none_when_no_degrees_of_freedom(self):
         # A 3-frequency upload gives 6 residuals against m = 21 parameters.
+        # Without a penalty the classical count gates; with one the effective
+        # count does, and at this data-dominated point gamma sits near npen
+        # (or the Hessian is not even positive definite), so both are gone.
         basis, data, x = _random_fit_problem(self.rng, 20, True, n_rows=6)
-        quality = _prony_fit_quality(x, data, basis, 1.0, True, n_resid=6, log_range=LOG_RANGE)
-        self.assertIsNone(quality.chi2_reduced)
+        for smoothness in (0.0, 1.0):
+            with self.subTest(smoothness=smoothness):
+                quality = _prony_fit_quality(
+                    x, data, basis, smoothness, True, n_resid=6,
+                    log_range=LOG_RANGE)
+                self.assertIsNone(quality.chi2_reduced)
 
     def test_scan_has_interior_minimum(self):
         # The payoff: -log posterior should trade misfit against roughness and
@@ -1478,6 +1518,25 @@ class TestPronyResolution(unittest.TestCase):
         viscous, _, _, _ = self._resolve(10, 1.0, solid=False, curve=curve)
         self.assertTrue(np.isfinite(viscous))
 
+    def test_never_exceeds_the_isotropic_prior_ceiling(self):
+        # noise_prony is gamma under the weakest scale-respecting prior; the
+        # smoothing prior (and NNLS's positivity) is more informative, so the
+        # resolution must land below it on both paths. Not a theorem — the
+        # priors are not nested, see prony_rank_limits — but the consistency
+        # bound that keeps the two counts honest against each other. Measured
+        # margin is >= 2x on every case here (e.g. 26 vs 51 NNLS at 20% error,
+        # 35.5 vs 91 at 0.1% error and smoothness 0.004).
+        omega, E_stor, E_loss, _ = _broadband_master_curve(600)
+        E_abs = np.abs(E_stor + 1j * E_loss)
+        for rel in (0.2, 0.01, 0.001):
+            std = E_abs * rel
+            _, noise_prony = prony_rank_limits(omega, E_stor, E_loss, std, std)
+            for smoothness in (0.0, 0.004, 0.04, 1.0):
+                with self.subTest(rel=rel, smoothness=smoothness):
+                    resolution, _, _, _ = self._resolve(
+                        10, smoothness, curve=(omega, E_stor, E_loss, std))
+                    self.assertLessEqual(resolution, noise_prony)
+
     def test_none_on_degenerate_input(self):
         omega, E_stor, E_loss, std = _broadband_master_curve(600)
         tau_i, E_i = smooth_prony_fit(omega, E_stor, E_loss, std, std,
@@ -1997,6 +2056,26 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
         r0 = basis[:, 0]
         resid = data - basis[:, 1:] @ E_i[1:]
         np.testing.assert_allclose(E_i[0], (r0 @ resid) / (r0 @ r0), rtol=1e-8)
+
+    def test_effective_terms_never_exceed_the_isotropic_prior_ceiling(self):
+        # The fit's own gamma against prony_rank_limits' noise_prony, at the
+        # grid cap where gamma is largest: the smoothing prior is the more
+        # informative one, so the count it leaves to the data must be the
+        # smaller. Empirical (see prony_rank_limits), measured margin >= 2x:
+        # 38 vs 91 at 0.1% error and smoothness 0.004, 4.8 vs 51 at 20%
+        # error and smoothness 0.4.
+        omega, E_stor, E_loss, _ = _broadband_master_curve(600)
+        E_abs = np.abs(E_stor + 1j * E_loss)
+        for rel, smoothness in ((0.001, 0.004), (0.2, 0.4)):
+            with self.subTest(rel=rel, smoothness=smoothness):
+                std = E_abs * rel
+                max_prony, noise_prony = prony_rank_limits(
+                    omega, E_stor, E_loss, std, std)
+                _, _, quality = smooth_prony_fit(
+                    omega, E_stor, E_loss, std, std, N=max_prony,
+                    smoothness=smoothness, solid=True,
+                    return_fit_quality=True)
+                self.assertLessEqual(quality.effective_terms, noise_prony)
 
     def test_clamped_equilibrium_is_exactly_zero_and_still_scored(self):
         # When the data cannot support an equilibrium modulus the projection

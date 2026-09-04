@@ -21,9 +21,11 @@ from .objective import (
 
 
 # Fit-quality readout for a converged smooth_prony_fit. chi2_reduced is the data
-# misfit alone; neg_log_posterior is the Laplace-approximated negative log
-# posterior of lam = smoothness**2; curvature is the roughness of the fitted log
-# spectrum. All three are "lower is better", and any may be None — see
+# misfit alone, per EFFECTIVE degree of freedom nu = n_resid - gamma_total
+# (see effective_terms below; gamma_total adds 1 for a free equilibrium term);
+# neg_log_posterior is the Laplace-approximated negative log posterior of
+# lam = smoothness**2; curvature is the roughness of the fitted log spectrum.
+# All three are "lower is better", and any may be None — see
 # _prony_fit_quality for the conditions.
 #
 # chi2_reduced and curvature are the two coordinates of the classical L-curve:
@@ -66,7 +68,20 @@ from .objective import (
 # theorem and the value is reported raw. It is the fit's OWN count and so can
 # never exceed the grid it ran on — reduction.prony_resolution is the
 # dense-grid version the grid suggestion compares against. None whenever
-# covariance is. Not displayed today.
+# covariance is. Not displayed itself; it sets the denominator of
+# chi2_reduced: a smoothed fit spends only gamma of its npen decaying
+# parameters on the data (the rest are pinned by the penalty), so the
+# classical n_resid - m overstates how many parameters the data paid for,
+# understates the residuals left, and so OVERSTATES the misfit — by 1.2-1.35x
+# on the 45-row PMMA file at its default 34-term grid (1% error, smoothness
+# 0.04-0.4), and by ever more as N grows while gamma saturates (at
+# n_resid = m it reads infinite for a fit that is fine).
+# With the effective count the readout stops depending on N once the grid
+# resolves the data. Empirically it also never exceeds
+# reduction.prony_rank_limits' noise_prony, the same count under the weakest
+# scale-respecting prior — not a theorem (the two priors are not nested:
+# this one is in log space at the fit and leaves the penalty's constant and
+# ramp directions free), but a consistency bound the tests assert.
 _FitQuality = namedtuple(
     '_FitQuality',
     'chi2_reduced neg_log_posterior curvature covariance effective_terms',
@@ -109,6 +124,18 @@ def _prony_fit_quality(
 ) -> _FitQuality:
     """
     Score a converged Prony fit: reduced chi-squared and the log posterior of lam.
+
+    chi2_reduced divides the weighted data misfit by the EFFECTIVE degrees of
+    freedom n_resid - (effective_terms + solid): the decaying terms count for
+    MacKay's gamma, the free equilibrium term (unpenalized, so exactly
+    data-determined) for 1. On the clamped-equilibrium path the caller
+    passes solid=False and n_resid lowered by one, which charges the pinned
+    term as a whole parameter — the same convention NNLS uses for its active
+    set. When no gamma exists (no penalty, or a Hessian that is not positive
+    definite) the classical n_resid - m is used instead. The penalty weight
+    always uses the classical count: _scaled_smoothness's dof normalization
+    is what keeps N from being a hidden smoothness knob, and making it depend
+    on a gamma that itself depends on the weight would be circular.
 
     The second number is a Laplace (saddle-point) approximation of
 
@@ -171,15 +198,17 @@ def _prony_fit_quality(
         solid (bool): Whether the leading coefficient is an equilibrium term
             excluded from the smoothness penalty.
         n_resid (int): Residual count of the FULL problem (2 * len(omega)), used
-            for the chi-squared degrees of freedom. It cannot be read off `data`,
-            whose length is the reduced m + 1 for any upload size.
+            for the chi-squared degrees of freedom and the penalty
+            normalization. It cannot be read off `data`, whose length is the
+            reduced m + 1 for any upload size.
         log_range (float): ln(tau_max / tau_min) of the fit grid, for the
             curvature normalization. Also unavailable from the reduced system.
 
     Returns:
         _FitQuality: (chi2_reduced, neg_log_posterior, curvature, covariance);
         the first three floats, all "lower is better". chi2_reduced is None
-        when the fit has no degrees of freedom left; neg_log_posterior is None
+        when the fit has no degrees of freedom left (effective ones when a
+        gamma exists, classical ones otherwise); neg_log_posterior is None
         when the posterior is undefined (no penalty, or fewer than 3 penalized
         terms) or when the Laplace expansion does not apply (Hess V not
         positive definite, or non-finite); curvature is None when fewer than 3
@@ -191,15 +220,16 @@ def _prony_fit_quality(
         count npen - lam * tr(L.T L covariance) (see the _FitQuality
         header), None exactly when covariance is. The two reported
         quantities are means —
-        chi-squared per degree of freedom, squared log-spectrum curvature per
-        unit ln(tau) — while the algebra below works in raw sums, so every
-        normalization happens once, at the single return.
+        chi-squared per effective degree of freedom, squared log-spectrum
+        curvature per unit ln(tau) — while the algebra below works in raw
+        sums, so every normalization happens once, at the single return.
     """
     m = len(logcoefs)
     npen = m - solid
-    # Data misfit only — the smoothness penalty is not part of chi-squared.
-    # Regularization means the effective parameter count is below m, so this
-    # dof understates nu and chi2_reduced reads as an upper bound.
+    # The classical count, which normalizes the penalty weight below. It is
+    # NOT the chi-squared denominator when a gamma exists: regularization
+    # leaves the effective parameter count below m, and chi2_reduced divides
+    # by the effective degrees of freedom instead (see the return).
     dof = n_resid - m
 
     # The weight the fit was actually run with, so that V and its Hessian below
@@ -272,8 +302,12 @@ def _prony_fit_quality(
                 + smoothness * smoothness
             )
 
+    # Data misfit only — the smoothness penalty is not part of chi-squared —
+    # per effective degree of freedom: gamma for the decaying terms plus 1 for
+    # a free equilibrium term, which the penalty never touches.
+    nu = dof if effective_terms is None else n_resid - (effective_terms + solid)
     return _FitQuality(
-        chi2 / dof if dof > 0 else None,
+        chi2 / nu if nu > 0 else None,
         neg_log_posterior,
         _mean_sq_curvature(curve, npen, log_range),
         covariance,

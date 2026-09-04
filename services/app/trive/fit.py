@@ -474,8 +474,10 @@ def smooth_prony_fit(
             log-coefficients. Pass 0 to disable. Normalized internally by
             sqrt(dof / h**3) (see _scaled_smoothness), h being the log-tau grid
             spacing, which makes it the exchange rate between the two numbers
-            the fit-quality readout reports: V/dof = chi2_reduced +
-            smoothness**2 * (log_range * curvature). A given value therefore
+            the fit-quality readout reports: V/dof = chi2/dof +
+            smoothness**2 * (log_range * curvature), with dof the classical
+            n_res - m (chi2_reduced is the same chi2 per EFFECTIVE degree of
+            freedom, see quality._prony_fit_quality). A given value therefore
             produces comparable smoothing whether the file has 400 rows or
             40,000, whether it is fit with 20 terms or 100, and whether it
             covers 4 decades or 20.
@@ -517,7 +519,11 @@ def smooth_prony_fit(
         effective number of well-determined decaying terms,
         npen - lam * tr(L.T L Sigma), available exactly when covariance is;
         being the fit's own count it never exceeds the grid it ran on (see
-        reduction.prony_resolution for the dense-grid version).
+        reduction.prony_resolution for the dense-grid version). It is what
+        quality.chi2_reduced divides by — the misfit per EFFECTIVE degree of
+        freedom n_res - (effective_terms + 1 for a free equilibrium term),
+        falling back to the classical n_res - m when no gamma exists (the
+        unsmoothed path always).
     """
     assert isinstance(omega, np.ndarray) and omega.ndim == 1, \
         "omega must be a 1-D numpy.ndarray"
