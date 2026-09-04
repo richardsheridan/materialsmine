@@ -10,6 +10,7 @@ NOT spin up a Flask app — that's test_routes / test_routes_e2e.
 
     python -m unittest tests.trive.test_update_line_chart
 """
+import re
 import unittest
 import os
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -20,7 +21,10 @@ from unittest.mock import patch
 # Append the directory above 'tests' to sys.path to find the 'app' module
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+from scipy.optimize import nnls
+
 from app.trive.prony import compute_complex, prony_terms_for_span
+from app.trive.reduction import _probe_grid, _prony_reduce
 from app.trive.quality import _FitQuality
 from app.trive.fit import (
     smooth_prony_fit,
@@ -1497,7 +1501,7 @@ class TestUpdateLineChartPlotDecimation(unittest.TestCase):
 
 
 class TestUpdateLineChartRankInfo(unittest.TestCase):
-    """The rank_info element and the noise-rank caption it drives."""
+    """The rank_info element and the grid-size suggestion stamped beside it."""
 
     @staticmethod
     def _frequency_upload(n_rows=300):
@@ -1514,7 +1518,15 @@ class TestUpdateLineChartRankInfo(unittest.TestCase):
     @staticmethod
     def _rank_notices(fig):
         return [a.text for a in fig.layout.annotations
-                if a.text and 'identifiable' in a.text]
+                if a.text and 'can support more terms' in a.text]
+
+    @staticmethod
+    def _suggested(notice):
+        # The caption carries exactly one number: the suggested grid size.
+        # The raw resolution it was scaled from is deliberately not shown.
+        numbers = re.findall(r'\d+', notice)
+        assert len(numbers) == 1, notice
+        return int(numbers[0])
 
     def _run(self, **overrides):
         args = dict(
@@ -1554,61 +1566,104 @@ class TestUpdateLineChartRankInfo(unittest.TestCase):
         self.assertEqual(set(rank_info), {'max_prony', 'noise_prony'})
         self.assertGreaterEqual(rank_info['max_prony'], 1)
 
-    def test_caption_when_terms_exceed_noise_rank(self):
-        # An enormous stated relative error leaves almost nothing
-        # identifiable, so a full-size request must be called out — on both
-        # figures that overlay the fit, with the count bound embedded. The
-        # wording is a BOUND ("at most ~k"), never a partition of the
-        # requested N: noise_prony counts singular directions, and no
-        # particular term is the identifiable one.
-        result = self._run(number_of_prony=100, relative_error=1000.0)
-        noise_prony = result[9]['noise_prony']
-        self.assertLess(noise_prony, 100)
+    def test_caption_when_the_grid_is_under_resolved(self):
+        # A grid coarser than what a tight error profile resolves at this
+        # smoothing must be called out — on both figures that overlay the
+        # fit — with a concrete size to try: above the request, at most the
+        # numerical-rank cap, and the only number in the caption.
+        result = self._run(number_of_prony=4, smoothness=0.1,
+                           relative_error=0.001)
+        max_prony = result[9]['max_prony']
         for fig in (result[0], result[1]):
             notices = self._rank_notices(fig)
             self.assertEqual(len(notices), 1)
             self.assertIn('if the error profile is accurate', notices[0])
-            self.assertIn(f'at most ~{noise_prony} terms', notices[0])
-            self.assertNotIn('of 100', notices[0])
+            self.assertIn('try a relaxation grid size of', notices[0])
+            suggested = self._suggested(notices[0])
+            self.assertGreater(suggested, 4)
+            self.assertLessEqual(suggested, max_prony)
+
+    def test_no_caption_at_the_default_grid(self):
+        # Three terms per decade sits above the data's resolution at any
+        # ordinary smoothing: the healthy case adds no visual noise.
+        N = prony_terms_for_span(self._frequency_upload()['Frequency'])
+        for smoothness, relative_error in ((0.1, 0.001), (0.1, 0.2), (0.0, 0.2)):
+            with self.subTest(smoothness=smoothness, relative_error=relative_error):
+                result = self._run(number_of_prony=N, smoothness=smoothness,
+                                   relative_error=relative_error)
+                for fig in (result[0], result[1]):
+                    self.assertEqual(self._rank_notices(fig), [])
+
+    def test_unsmoothed_path_measures_against_the_nnls_active_set(self):
+        # With no smoothing the resolution is the probe grid's NNLS active
+        # set, and the suggestion is 1.5x that (capped at max_prony). NNLS is
+        # invariant to a uniform error scale, so noise_prony — which is not —
+        # plays no part: an absurd error setting that leaves noise_prony at
+        # zero changes nothing here.
+        upload = self._frequency_upload()
+        omega = upload['Frequency']
+        std = np.abs(upload['E Storage'] + 1.0j * upload['E Loss'])
+        R, z = _prony_reduce(omega, upload['E Storage'], upload['E Loss'],
+                             std, std, _probe_grid(omega), True, 0.2)
+        active = int(np.count_nonzero(nnls(R, z)[0][1:] > 0))
+        self.assertGreater(active, 3)
+        for relative_error in (0.2, 1000.0):
+            with self.subTest(relative_error=relative_error):
+                result = self._run(number_of_prony=3, smoothness=0.0,
+                                   relative_error=relative_error)
+                expected = min(result[9]['max_prony'],
+                               int(np.ceil(1.5 * active)))
+                notices = self._rank_notices(result[0])
+                self.assertEqual(len(notices), 1)
+                self.assertEqual(self._suggested(notices[0]), expected)
+        # A request ABOVE the resolution is not called out — those terms are
+        # the smoothing's (or the active set's zeros) to fill. This was the
+        # old caption's firing case.
+        result = self._run(number_of_prony=100, relative_error=1000.0)
+        self.assertEqual(result[9]['noise_prony'], 0)
+        for fig in (result[0], result[1]):
+            self.assertEqual(self._rank_notices(fig), [])
+
+    def test_no_caption_when_the_cap_already_binds(self):
+        # Nothing to suggest when the numerical-rank cap is at or below the
+        # request: the suggestion would not raise N.
+        with patch('app.trive.chart.prony_rank_limits', return_value=(4, 50)):
+            result = self._run(number_of_prony=4, smoothness=0.0)
+        self.assertEqual(result[9]['max_prony'], 4)
+        for fig in (result[0], result[1]):
+            self.assertEqual(self._rank_notices(fig), [])
 
     def test_caption_wording_stays_out_of_the_other_filters(self):
         # The decimation and quality test helpers select notices by substring;
-        # the rank caption must never match either filter.
-        result = self._run(number_of_prony=100, relative_error=1000.0)
+        # the suggestion must never match either filter.
+        result = self._run(number_of_prony=4, smoothness=0.1,
+                           relative_error=0.001)
         notice = self._rank_notices(result[0])[0]
         self.assertNotIn('decimated by', notice)
         self.assertNotIn('lower is better', notice)
 
-    def test_no_caption_when_error_profile_supports_the_request(self):
-        # A tight error profile determines more modes than the request — the
-        # healthy case adds no visual noise.
-        result = self._run(number_of_prony=5, relative_error=0.001)
-        self.assertGreaterEqual(result[9]['noise_prony'], 5)
-        for fig in (result[0], result[1]):
-            self.assertEqual(self._rank_notices(fig), [])
-
     def test_rank_caption_stacks_a_third_row_with_headroom(self):
-        # Decimation notice + quality readout + rank caption is the first
+        # Decimation notice + quality readout + grid suggestion is the first
         # three-row stack; the top margin must keep growing so the new top
         # row is not clipped (see _stamp_notice).
         big = self._frequency_upload(_PLOT_MAX_POINTS + 500)
         kwargs = dict(
-            uploadData=big, number_of_prony=10, smoothness=1.0,
+            uploadData=big, smoothness=1.0, relative_error=0.001,
             fit_settings=False, domain='frequency',
         )
-        two_rows = update_line_chart(relative_error=0.2, **kwargs)[0]
-        three_rows = update_line_chart(relative_error=1000.0, **kwargs)[0]
+        two_rows = update_line_chart(number_of_prony=10, **kwargs)[0]
+        three_rows = update_line_chart(number_of_prony=3, **kwargs)[0]
         self.assertEqual(len(self._rank_notices(two_rows)), 0)
         self.assertEqual(len(self._rank_notices(three_rows)), 1)
         self.assertGreater(three_rows.layout.margin.t,
                            two_rows.layout.margin.t)
         # Same-thing-every-move notices stack above the readout being watched:
-        # the rank caption takes the top row.
+        # the suggestion takes the top row.
         stamped = [a for a in three_rows.layout.annotations
                    if a.name == 'figure-notice']
         self.assertEqual(len(stamped), 3)
         top = max(stamped, key=lambda a: a.y)
-        self.assertIn('identifiable', top.text)
+        self.assertIn('can support more terms', top.text)
 
 
 if __name__ == '__main__':

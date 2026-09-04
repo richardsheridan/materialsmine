@@ -14,6 +14,7 @@ from scipy.linalg import cho_solve
 from .objective import (
     _log_curvature,
     _mean_sq_curvature,
+    _penalty_trace,
     _PronyLoss,
     _scaled_smoothness,
 )
@@ -52,9 +53,24 @@ from .objective import (
 # returned: shape (len(E_i), ...) when the equilibrium term was a free
 # parameter (its log in row 0), shape (len(tau_i), ...) decaying-only on the
 # solid=False and clamped-equilibrium paths.
+#
+# effective_terms is MacKay's effective number of well-determined parameters
+# over the PENALIZED (decaying) terms: gamma = npen - lam * tr(L.T L Sigma),
+# with Sigma the covariance above (= inv(J.T J + diag(r.T J) + lam L.T L),
+# the 2 in 2 * inv(Hess V) cancelling the 2 in Hess V). Each decaying term
+# contributes 1 - lam * (L.T L Sigma)_ii: 1 where the data pins it, 0 where
+# the penalty does. The unpenalized equilibrium row would contribute exactly
+# 1 and is left out, so the count is in the slider's units on both the
+# interior and the clamped-equilibrium paths. Bounded above by npen; the
+# exact-Hessian diag(r.T J) can be negative, so the lower bound 0 is not a
+# theorem and the value is reported raw. It is the fit's OWN count and so can
+# never exceed the grid it ran on — reduction.prony_resolution is the
+# dense-grid version the grid suggestion compares against. None whenever
+# covariance is. Not displayed today.
 _FitQuality = namedtuple(
-    '_FitQuality', 'chi2_reduced neg_log_posterior curvature covariance',
-    defaults=(None,),
+    '_FitQuality',
+    'chi2_reduced neg_log_posterior curvature covariance effective_terms',
+    defaults=(None, None),
 )
 
 
@@ -171,7 +187,10 @@ def _prony_fit_quality(
         m x m Laplace posterior covariance 2 * inv(Hess V) of logcoefs (see
         the _FitQuality header), None exactly when there is no penalty or no
         positive-definite Hessian — but NOT gated on the npen >= 3 posterior
-        condition. The two reported quantities are means —
+        condition. effective_terms is the decaying-term effective parameter
+        count npen - lam * tr(L.T L covariance) (see the _FitQuality
+        header), None exactly when covariance is. The two reported
+        quantities are means —
         chi-squared per degree of freedom, squared log-spectrum curvature per
         unit ln(tau) — while the algebra below works in raw sums, so every
         normalization happens once, at the single return.
@@ -206,6 +225,7 @@ def _prony_fit_quality(
     # set pins coefficients at exact zeros where log-space has no curvature.
     neg_log_posterior = None
     covariance = None
+    effective_terms = None
     if smoothness:
         # hess() returns a fresh array, so nothing cached is at stake in the
         # factorization.
@@ -222,6 +242,10 @@ def _prony_fit_quality(
             # factors or eigenvalues of it.
             covariance = cho_solve((chol, True), 2.0 * np.eye(m))
             covariance = 0.5 * (covariance + covariance.T)
+            # MacKay's gamma over the penalized block; see the _FitQuality
+            # header. covariance IS inv(J.T J + diag(r.T J) + lam L.T L).
+            effective_terms = float(
+                npen - scaled * scaled * _penalty_trace(covariance, solid))
         # Too few penalized terms for a second difference to exist means there
         # is no prior on lam to be posterior about. npen < 3 would also reach
         # log(npen - 1) = log(0) below.
@@ -253,4 +277,5 @@ def _prony_fit_quality(
         neg_log_posterior,
         _mean_sq_curvature(curve, npen, log_range),
         covariance,
+        effective_terms,
     )

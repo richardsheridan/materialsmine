@@ -8,6 +8,8 @@ Presentation only — nothing here changes a number the fit produced. `chart`
 orchestrates the calls; the figures go out as JSON via the route.
 """
 
+import math
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -136,42 +138,56 @@ def _annotate_decimation(figs, percent) -> None:
     ))
 
 
-def _annotate_rank_limit(figs, requested_n, noise_prony) -> None:
+def _annotate_grid_suggestion(figs, requested_n, resolution, max_prony) -> None:
     """
-    Stamp a notice when the requested term count exceeds the noise-limited rank.
+    Suggest a finer relaxation grid when the data resolves more terms than
+    the request offers.
 
-    noise_prony is prony_rank_limits' count of SINGULAR DIRECTIONS of the
-    weighted system the SELECTED error profile statistically determines — a
-    count, not a roster: no particular Prony term is the identifiable one,
-    and nothing computes which coefficient combinations clear the threshold.
-    The wording is therefore a bound ("at most ~k terms are identifiable"),
-    never a partition of the requested N into determined and undetermined
-    terms — an earlier "only ~k of N terms are data-determined" draft implied
-    exactly that and was reworded (user feedback, 2026-08-25). "The rest is
-    smoothing" tells the user what fills the surplus degrees of freedom: the
-    prior, collectively — the fit is not wrong, just not data past that
-    point. The wording is deliberately conditional ("if the error profile is
-    accurate...") because the count is only as trustworthy as the error
-    columns or relative-error setting it was computed under — it is a
-    statement about the user's stated uncertainty, not a fact about the data
-    alone. The "~" absorbs the equilibrium-column bookkeeping (noise_prony
-    counts it, the slider does not).
+    resolution is the data's term-count resolution under the SELECTED error
+    profile and smoothing, from reduction.prony_resolution: the dense-grid
+    effective parameter count gamma (rounded) when smoothing is on, the
+    probe-grid NNLS active-set size when it is off. Fires only when
+    requested_n < resolution — a grid coarser than what the data can place —
+    and suggests min(max_prony, ceil(1.5 * resolution)): 1.5x because gamma
+    counts well-determined DIRECTIONS and a grid needs nodes around each to
+    place them (the 3-per-decade default sits at ~1.5x the measured
+    resolution of the bundled files); capped at max_prony because past the
+    numerical rank extra nodes are redundant columns. No stamp when the
+    suggestion would not actually raise N (the cap already binds), when
+    resolution is None (nothing to measure against), or when the request
+    already meets the resolution — the healthy case adds no visual noise,
+    and a request ABOVE the resolution is not called out at all: the extra
+    terms are then the smoothing's to fill, which is what smoothing is for.
 
-    No-op when noise_prony is None or when the profile supports every
-    requested term — the healthy case adds no visual noise. Stamped after the
-    fit-quality readout and the decimation notice, so it takes the top row:
-    like the decimation notice, it says the same thing on every slider move.
+    The raw resolution is deliberately not surfaced — it is an estimate with
+    its own ~20% error bar, and the user's action is the grid size, not the
+    count — only the scaled, capped suggestion is. Still conditional on the
+    error profile ("if the error profile is accurate"): resolution is a
+    statement about the user's stated uncertainty, not about the data alone.
+    The previous caption here read "at most ~k terms are identifiable; the
+    rest is smoothing" from prony_rank_limits' noise count; that count is a
+    smoothness-free ceiling 2-4x above what any smoothed fit resolves, so it
+    never fired at a sensible N and, when it did, named a number no action
+    followed from (retired 2026-09-04).
+
+    Stamped after the fit-quality readout and the decimation notice, so it
+    takes the top row: like the decimation notice, it says the same thing on
+    every slider move.
 
     Parameters:
         figs: Iterable of plotly Figures to annotate.
         requested_n (int): The effective Prony term count the fit ran with.
-        noise_prony (int or None): Noise-limited rank, or None to no-op.
+        resolution (int or None): The data's resolution in terms, or None.
+        max_prony (int or None): The numerical-rank cap on the grid size.
     """
-    if noise_prony is None or noise_prony >= requested_n:
+    if resolution is None or max_prony is None or requested_n >= resolution:
+        return
+    n_suggest = min(int(max_prony), int(math.ceil(1.5 * resolution)))
+    if n_suggest <= requested_n:
         return
     _stamp_notice(figs, (
-        f"if the error profile is accurate, at most ~{noise_prony} terms "
-        f"are identifiable; the rest is smoothing"
+        f"if the error profile is accurate, the data can support more "
+        f"terms; try a relaxation grid size of {n_suggest}"
     ))
 
 

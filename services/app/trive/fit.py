@@ -513,7 +513,11 @@ def smooth_prony_fit(
         log-coefficients, None on the unsmoothed path or when the Hessian is
         not positive definite; on the clamped-equilibrium path it covers the
         N decaying log-coefficients only (no equilibrium row), matching the
-        problem the solver converged on.
+        problem the solver converged on. quality.effective_terms is MacKay's
+        effective number of well-determined decaying terms,
+        npen - lam * tr(L.T L Sigma), available exactly when covariance is;
+        being the fit's own count it never exceeds the grid it ran on (see
+        reduction.prony_resolution for the dense-grid version).
     """
     assert isinstance(omega, np.ndarray) and omega.ndim == 1, \
         "omega must be a 1-D numpy.ndarray"

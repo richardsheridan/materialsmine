@@ -7,7 +7,11 @@ must agree on what "roughness of the log spectrum" means: `_log_curvature` is
 the single definition both `_prony_objective` (which squares it into the loss)
 and `quality._prony_fit_quality` (which reports it) go through. Likewise
 `_PronyLoss.hess` is the one second derivative, used both by the Newton solver
-in `fit` and inside the Laplace determinant in `quality`.
+in `fit` and inside the Laplace determinant in `quality`; and
+`_add_penalty_inplace` / `_penalty_trace` are the one definition of the
+penalty operator L.T @ L behind that Hessian, the covariance-derived
+effective term count (`quality`), and the probe-grid resolution
+(`reduction.prony_resolution`).
 
 Depends on nothing else in the package — `quality` and `fit` both import from
 here, so keeping it a leaf is what keeps those two acyclic.
@@ -20,6 +24,69 @@ import numpy as np
 # weights in _prony_objective, and the outer product that builds lam * L.T @ L
 # in _prony_fit_quality.
 _D2_STENCIL = (1.0, -2.0, 1.0)
+
+
+def _penalty_band(m: int, solid: bool) -> np.ndarray:
+    """Leading row index of each second difference the penalty is taken over."""
+    npen = m - solid
+    return solid + np.arange(max(npen - 2, 0))
+
+
+def _add_penalty_inplace(H: np.ndarray, lam: float, solid: bool) -> None:
+    """
+    H += lam * L.T @ L, in place, on the penalized block.
+
+    L is the (npen - 2) x m second-difference stencil over the penalized
+    coordinates (all of them, or all but a leading unpenalized equilibrium
+    term when solid), so L.T @ L is pentadiagonal; the nine stencil
+    outer-product terms are accumulated straight onto its bands without ever
+    forming L. Index pairs are strictly increasing within each (t, u) pass,
+    so there is no fancy-index += aliasing. Correct at npen == 3, where the
+    two boundary corrections collide and the generic band pattern
+    [1, 5, 6, ..., 6, 5, 1] does not apply, and at npen < 3, where the band
+    is empty and the penalty is identically zero.
+
+    The ONE definition of the penalty operator: the solver Hessian
+    (_PronyLoss.hess), the Laplace covariance built from it (quality), and
+    the probe-grid effective-parameter count (reduction.prony_resolution) all
+    go through here or through _penalty_trace, so they cannot drift apart.
+
+    Parameters:
+        H (numpy.ndarray): (m, m) array to accumulate onto.
+        lam (float): Penalty weight (the SCALED smoothness, squared).
+        solid (bool): Whether row/column 0 is an unpenalized equilibrium term.
+    """
+    band = _penalty_band(len(H), solid)
+    for t, stencil_t in enumerate(_D2_STENCIL):
+        for u, stencil_u in enumerate(_D2_STENCIL):
+            H[band + t, band + u] += lam * stencil_t * stencil_u
+
+
+def _penalty_trace(sigma: np.ndarray, solid: bool) -> float:
+    """
+    tr(L.T @ L @ sigma) from sigma's five penalty bands alone.
+
+    With A = L.T @ L and L_k,(k+t) = stencil_t,
+    tr(A sigma) = sum_ij A_ij sigma_ij = sum_k sum_tu stencil_t * stencil_u
+    * sigma[k+t, k+u] over the penalized rows k — the same nine (t, u)
+    passes _add_penalty_inplace makes, read instead of written. This is the
+    trace MacKay's effective number of well-determined parameters needs:
+    gamma = npen - lam * tr(A Sigma) for the posterior covariance Sigma.
+    Zero when npen < 3 (empty band).
+
+    Parameters:
+        sigma (numpy.ndarray): (m, m) symmetric matrix, e.g. a covariance.
+        solid (bool): Whether row/column 0 is an unpenalized equilibrium term.
+
+    Returns:
+        float: The trace.
+    """
+    band = _penalty_band(len(sigma), solid)
+    return float(sum(
+        stencil_t * stencil_u * sigma[band + t, band + u].sum()
+        for t, stencil_t in enumerate(_D2_STENCIL)
+        for u, stencil_u in enumerate(_D2_STENCIL)
+    ))
 
 
 def _log_curvature(logcoefs: np.ndarray, solid: bool) -> np.ndarray:
@@ -217,6 +284,7 @@ class _PronyLoss:
             numpy.ndarray: fresh (m, m) symmetric Hessian, m = len(logcoefs).
         """
         coefs, _, rj = self._at(logcoefs)
+        # H = 2*(lam * L.T @ L + J.T @ J + diag(r.T @ J)), assembled in ONE m x m array
         if self._gram is None:
             self._gram = self._basis.T @ self._basis
         # The product allocates, so the in-place scaling below cannot touch
@@ -228,19 +296,9 @@ class _PronyLoss:
         np.einsum('ii->i', H)[...] += rj
 
         if self._smoothness:
-            # lam * L.T @ L is pentadiagonal; accumulate the nine stencil
-            # outer-product terms straight onto its bands. Index pairs are
-            # strictly increasing within each (t, u) pass, so there is no
-            # fancy-index += aliasing. The loop also stays correct at npen == 3,
-            # where the two boundary corrections collide and the generic band
-            # pattern [1, 5, 6, ..., 6, 5, 1] does not apply — and at npen < 3,
-            # where band is empty and the penalty is identically zero.
-            lam = self._smoothness * self._smoothness
-            npen = len(logcoefs) - self._solid
-            band = self._solid + np.arange(max(npen - 2, 0))
-            for t, stencil_t in enumerate(_D2_STENCIL):
-                for u, stencil_u in enumerate(_D2_STENCIL):
-                    H[band + t, band + u] += lam * stencil_t * stencil_u
+            # lam * L.T @ L, pentadiagonal, accumulated onto its bands.
+            _add_penalty_inplace(
+                H, self._smoothness * self._smoothness, self._solid)
 
         H *= 2  # squared errors, matching the factor jac returns
         return H

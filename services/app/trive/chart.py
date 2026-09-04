@@ -16,12 +16,12 @@ from app.utils.util import log_errors
 
 from .prony import prony_terms_for_span
 from .fit import smooth_prony_fit
-from .reduction import prony_rank_limits
+from .reduction import prony_rank_limits, prony_resolution
 from .tts import tts_frequency_to_temperature_V2, tts_temperature_to_frequency_V2
 from .figures import (
     _annotate_decimation,
     _annotate_fit_quality,
-    _annotate_rank_limit,
+    _annotate_grid_suggestion,
     _build_coef_records,
     _build_complex_figures,
     _build_relaxation_figures,
@@ -108,7 +108,9 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
         shift_records (list): The table behind fig5; [] when fig5 is empty.
         rank_info (dict or None): {'max_prony': int, 'noise_prony': int} from
             prony_rank_limits on the master curve the fit consumed — the
-            data's arithmetic and statistical term-count ceilings. None on the
+            numerical-rank slider cap and the prior-free noise ceiling. The
+            grid-size suggestion itself (prony_resolution against the
+            request) rides in the figure captions, not here. None on the
             temperature preview path, where no master curve exists to probe.
 
     Raises:
@@ -297,8 +299,8 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # Rank ceilings of the master curve the fit is about to consume — probed
     # here, after any transform, so a temperature upload is measured on the
     # span the fit actually sees (same reasoning as the span cap above). The
-    # same std arrays and std_scale go in, so the noise count reflects the
-    # error profile the user selected.
+    # same std arrays and std_scale go in here and into prony_resolution
+    # below, which shares this probe's reduction.
     max_prony, noise_prony = prony_rank_limits(
         omega=df['Frequency'].to_numpy(),
         E_stor=E_stor_arr,
@@ -316,6 +318,21 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
         N=number_of_prony, smoothness=smoothness,
         return_fit_quality=True, std_scale=std_scale,
     )
+    # The data's term-count resolution the grid suggestion is measured
+    # against: the dense-grid effective parameter count at this smoothing,
+    # linearized at the fit just made (or, with no smoothing, the probe
+    # grid's NNLS active set). Rounded here so the caption compares
+    # integers; None degrades the suggestion to silence.
+    resolution = prony_resolution(
+        omega=df['Frequency'].to_numpy(),
+        E_stor=E_stor_arr,
+        E_loss=E_loss_arr,
+        E_stor_std=E_stor_std,
+        E_loss_std=E_loss_std,
+        tau_i=tau_i, E_i=E_i, smoothness=smoothness,
+        solid=True, std_scale=std_scale,
+    )
+    resolution = None if resolution is None else int(round(resolution))
     # Decaying terms only. The equilibrium coefficient is a separate parameter,
     # not a relaxation mode: it has no tau_i, it is excluded from the smoothness
     # penalty, the coefficient table drops it, and fig3 draws it as its own
@@ -349,8 +366,10 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     _annotate_fit_quality((fig1, fig11), fit_quality)
     _annotate_decimation((fig1, fig11), freq_decimation)
     # number_of_prony is the EFFECTIVE count here (the temperature branch may
-    # have capped it above), which is what the caption should compare against.
-    _annotate_rank_limit((fig1, fig11), number_of_prony, noise_prony)
+    # have capped it above), which is what the suggestion should compare
+    # against; max_prony caps what it may suggest.
+    _annotate_grid_suggestion(
+        (fig1, fig11), number_of_prony, resolution, max_prony)
     fig2, fig3 = _build_relaxation_figures(
         tau_i, E_i, N_nz, fit_settings, covariance=covariance)
     coef_records = _build_coef_records(tau_i, E_i, covariance=covariance)

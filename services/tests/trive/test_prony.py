@@ -15,7 +15,7 @@ import sys
 from unittest import mock
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
+from scipy.optimize import minimize, nnls
 
 # Append the directory above 'tests' to sys.path to find the 'app' module
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -31,13 +31,20 @@ from app.trive.prony import (
     compute_relaxation_modulus,
 )
 from app.trive.objective import (
+    _add_penalty_inplace,
+    _penalty_trace,
     _PronyLoss,
     _prony_hessian,
     _prony_objective,
     _scaled_smoothness,
 )
-from app.trive.reduction import _prony_reduce, prony_rank_limits
-from app.trive.quality import _prony_fit_quality
+from app.trive.reduction import (
+    _probe_grid,
+    _prony_reduce,
+    prony_rank_limits,
+    prony_resolution,
+)
+from app.trive.quality import _FitQuality, _prony_fit_quality
 import app.trive.fit as prony_fit
 from app.trive.fit import (
     smooth_prony_fit,
@@ -888,6 +895,12 @@ class TestPronyFitQuality(unittest.TestCase):
         self.assertEqual(len(unsmoothed), 3)
         self.assertIsNotNone(unsmoothed[2].chi2_reduced)
         self.assertIsNone(unsmoothed[2].neg_log_posterior)
+        # The quality tuple itself is five fields, the last two defaulted so
+        # the three-positional NNLS-path construction keeps working.
+        self.assertEqual(len(smoothed[2]), 5)
+        self.assertIsNotNone(smoothed[2].effective_terms)
+        self.assertIsNone(unsmoothed[2].effective_terms)
+        self.assertIsNone(_FitQuality(1.0, None, None).effective_terms)
 
     def test_nnls_path_chi2_matches_explicit_residual(self):
         # The smoothness == 0 branch takes chi2 straight from nnls's returned
@@ -965,6 +978,61 @@ class TestPronyFitQuality(unittest.TestCase):
             x, data, basis, 0.5, True, n_resid=2 * len(data), log_range=LOG_RANGE,
         )
         self.assertIsNone(quality.covariance)
+
+    def test_penalty_helpers_match_the_dense_operator(self):
+        # _add_penalty_inplace and _penalty_trace are the banded forms of
+        # lam * L.T @ L and tr(L.T @ L @ sigma); pin them to the dense
+        # operator, including the npen == 3 boundary collision and the
+        # empty-band npen == 2 case, with and without an equilibrium column.
+        for solid in (True, False):
+            for npen in (2, 3, 4, 10):
+                with self.subTest(solid=solid, npen=npen):
+                    m = npen + solid
+                    L = np.diff(np.eye(npen), n=2, axis=0)
+                    if solid:
+                        L = np.concatenate((np.zeros((len(L), 1)), L), axis=1)
+                    A = L.T @ L
+                    G = self.rng.normal(size=(m, m))
+                    sigma = G @ G.T + np.eye(m)
+                    dense = np.trace(A @ sigma)
+                    self.assertAlmostEqual(
+                        _penalty_trace(sigma, solid), dense,
+                        delta=1e-9 * (1 + abs(dense)))
+                    H = np.zeros((m, m))
+                    _add_penalty_inplace(H, 0.7, solid)
+                    np.testing.assert_allclose(H, 0.7 * A, atol=1e-12)
+
+    def test_effective_terms_bounded_and_decreasing_in_smoothness(self):
+        # MacKay's gamma: at most one per penalized term, and more smoothing
+        # hands more of them to the prior.
+        counts = []
+        for smoothness in (0.1, 1.0, 10.0):
+            basis, data, x = _converged_fit_problem(
+                self.rng, N=10, smoothness=smoothness)
+            quality = _prony_fit_quality(
+                x, data, basis, smoothness, True,
+                n_resid=2 * len(data), log_range=LOG_RANGE,
+            )
+            self.assertIsNotNone(quality.effective_terms)
+            self.assertGreaterEqual(quality.effective_terms, 0.0)
+            self.assertLessEqual(quality.effective_terms, 10.0 + 1e-9)
+            counts.append(quality.effective_terms)
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        self.assertGreater(counts[0], counts[-1])
+
+    def test_effective_terms_none_without_covariance(self):
+        # Same availability as the covariance it is computed from.
+        basis, data, x = _random_fit_problem(self.rng, 8, True)
+        quality = _prony_fit_quality(
+            x, data, basis, 0.0, True, n_resid=2 * len(data), log_range=LOG_RANGE,
+        )
+        self.assertIsNone(quality.effective_terms)
+        basis, data, _ = _converged_fit_problem(self.rng)
+        x = np.full(basis.shape[1], -10.0)
+        quality = _prony_fit_quality(
+            x, data, basis, 0.5, True, n_resid=2 * len(data), log_range=LOG_RANGE,
+        )
+        self.assertIsNone(quality.effective_terms)
 
     def test_covariance_survives_fewer_than_three_taus(self):
         # Deliberately NOT gated on npen >= 3: with the penalty identically
@@ -1277,13 +1345,16 @@ class TestPronyRankLimits(unittest.TestCase):
         self.assertLess(low, full)
 
     def test_cap_counts_sqrt_eps_not_eps(self):
-        # The precision ceiling thresholds singular values at sqrt(eps), not
-        # eps: the Newton solver works through the Hessian, whose Gauss-Newton
-        # part squares the basis condition, so modes between sqrt(eps) and eps
-        # of sigma_max make the Hessian numerically singular — the regime where
-        # scipy's trust-exact subproblem was observed to loop forever (this
-        # very fixture at decades=2, N=35..41). Someone "tightening" sqrt(eps)
-        # back to eps would re-open the slider's path into that regime.
+        # The cap thresholds singular values at sqrt(eps), not eps: what the
+        # solver and the covariance factor is the Gram R.T @ R, whose
+        # eigenvalues are the SQUARED singular values, so sqrt(eps) on the
+        # basis is eps on the Gram and the count is the Gram's float64
+        # numerical rank. Columns past it are redundant — the data cannot
+        # tell them from combinations of the others, so only the prior fills
+        # them — which is what makes the cap a sensible slider ceiling. It is
+        # NOT a hang guard: scipy's subproblem hang reproduced BELOW this cap
+        # (see TestNewtonHessianShift), and "tightening" to eps would merely
+        # offer the slider more redundant columns.
         omega, E_stor, E_loss, std = self._master(2)
         max_prony, _ = prony_rank_limits(omega, E_stor, E_loss, std, std,
                                          solid=True, std_scale=0.01)
@@ -1312,6 +1383,111 @@ class TestPronyRankLimits(unittest.TestCase):
         self.assertGreaterEqual(max_prony, 1)
         self.assertLessEqual(max_prony, 4)
         self.assertLessEqual(noise_prony, 4)
+
+
+class TestPronyResolution(unittest.TestCase):
+    """
+    The dense-grid resolution the grid-size suggestion measures against
+    (reduction.prony_resolution): the linearized probe-grid gamma when
+    smoothing is on, the probe-grid NNLS active set when it is off.
+    """
+
+    def setUp(self):
+        reduction._REDUCE_CACHE.clear()
+
+    @staticmethod
+    def _resolve(N, smoothness, solid=True, curve=None, **fit_kwargs):
+        omega, E_stor, E_loss, std = curve or _broadband_master_curve(600)
+        tau_i, E_i, quality = smooth_prony_fit(
+            omega, E_stor, E_loss, std, std, N=N, smoothness=smoothness,
+            solid=solid, return_fit_quality=True, **fit_kwargs)
+        resolution = prony_resolution(
+            omega, E_stor, E_loss, std, std, tau_i, E_i, smoothness, solid)
+        return resolution, quality, tau_i, E_i
+
+    def test_unsmoothed_path_counts_the_nnls_active_set(self):
+        # lambda = 0: the number of probe nodes NNLS chooses to carry, an
+        # integer-valued float, recomputed here straight from the probe.
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        resolution, _, _, _ = self._resolve(10, 0.0)
+        R, z = _prony_reduce(omega, E_stor, E_loss, std, std,
+                             _probe_grid(omega), True, 1.0)
+        active, _ = nnls(R, z)
+        self.assertEqual(resolution, float(np.count_nonzero(active[1:] > 0)))
+        self.assertGreaterEqual(resolution, 1.0)
+
+    def test_reuses_the_probe_reduction(self):
+        # Same probe grid, same cache entry as prony_rank_limits: the
+        # resolution must add no QR pass and no cache slot of its own.
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        calls = []
+        original = np.linalg.qr
+
+        def counting_qr(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        np.linalg.qr = counting_qr
+        try:
+            prony_rank_limits(omega, E_stor, E_loss, std, std)
+            tau_i, E_i = smooth_prony_fit(omega, E_stor, E_loss, std, std,
+                                          N=12, smoothness=0.1)
+            after_fit = len(calls)
+            resolution = prony_resolution(
+                omega, E_stor, E_loss, std, std, tau_i, E_i, 0.1)
+        finally:
+            np.linalg.qr = original
+        self.assertIsNotNone(resolution)
+        self.assertEqual(len(calls), after_fit, msg='probe cache miss')
+        self.assertEqual(len(reduction._REDUCE_CACHE), 2)
+
+    def test_roughly_independent_of_the_fit_grid(self):
+        # The whole point: a coarse fit must still see how many terms a
+        # dense grid would resolve (measured within ~20% down to N = 4).
+        coarse, _, _, _ = self._resolve(6, 0.1)
+        omega = _broadband_master_curve(600)[0]
+        fine, _, _, _ = self._resolve(prony_terms_for_span(omega), 0.1)
+        self.assertLessEqual(abs(coarse - fine), 0.3 * max(coarse, fine))
+
+    def test_agrees_with_the_fit_gamma_when_the_grid_resolves_the_data(self):
+        # Once the grid is dense enough the fit's own effective term count
+        # (quality.effective_terms) has saturated at the same number this
+        # linearization estimates — the consistency check between the two.
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        max_prony, _ = prony_rank_limits(omega, E_stor, E_loss, std, std)
+        resolution, quality, _, _ = self._resolve(max_prony, 0.1)
+        self.assertLessEqual(abs(resolution - quality.effective_terms),
+                             0.25 * quality.effective_terms)
+
+    def test_bounded_and_decreasing_in_smoothness(self):
+        loose, _, _, _ = self._resolve(12, 0.04)
+        tight, _, _, _ = self._resolve(12, 1.0)
+        for value in (loose, tight):
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, reduction._RANK_PROBE_TERMS)
+        self.assertGreater(loose, tight)
+
+    def test_handles_the_clamped_and_viscous_parameterizations(self):
+        # Equilibrium clamped at exactly zero (the probe drops its column)
+        # and a solid=False fit (there never was one): both finite.
+        curve = _unresolved_equilibrium_curve()
+        clamped, _, _, E_i = self._resolve(
+            10, 1.0, curve=curve, grid_extension_decades=0.0)
+        self.assertEqual(E_i[0], 0.0)
+        self.assertTrue(np.isfinite(clamped))
+        viscous, _, _, _ = self._resolve(10, 1.0, solid=False, curve=curve)
+        self.assertTrue(np.isfinite(viscous))
+
+    def test_none_on_degenerate_input(self):
+        omega, E_stor, E_loss, std = _broadband_master_curve(600)
+        tau_i, E_i = smooth_prony_fit(omega, E_stor, E_loss, std, std,
+                                      N=12, smoothness=0.1)
+        self.assertIsNone(prony_resolution(
+            omega, E_stor, E_loss, std, std, tau_i[:1], E_i[:2], 0.1))
+        zeroed = E_i.copy()
+        zeroed[3] = 0.0
+        self.assertIsNone(prony_resolution(
+            omega, E_stor, E_loss, std, std, tau_i, zeroed, 0.1))
 
 
 class TestSmoothPronyFit(unittest.TestCase):
@@ -1850,6 +2026,13 @@ class TestSmoothPronyFitNewton(unittest.TestCase):
                                delta=5e-3 * q_visc.chi2_reduced)
         self.assertAlmostEqual(q_solid.neg_log_posterior,
                                q_visc.neg_log_posterior, delta=0.5)
+        # The effective term count is over the decaying terms on both
+        # scorings, so it is finite, at most N, and the same optimum's.
+        for q in (q_solid, q_visc):
+            self.assertTrue(np.isfinite(q.effective_terms))
+            self.assertLessEqual(q.effective_terms, 10.0 + 1e-9)
+        self.assertAlmostEqual(q_solid.effective_terms,
+                               q_visc.effective_terms, delta=0.5)
 
     def test_covariance_shape_follows_the_returned_parameterization(self):
         # The consumer contract (see the _FitQuality header): Sigma has one row
