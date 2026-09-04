@@ -65,9 +65,12 @@ export const PRONY_TERMS_MAX = 100;
 /**
  * Effective maximum for the relaxation-grid-size slider.
  *
- * The extract response carries `max_prony`, the eps-rank of the fitted master
- * curve — the number of Prony terms the data's span and numerical precision
- * can actually determine; terms past it are numerical null space. Cap-only
+ * The extract response carries `max_prony`, the numerical rank of the fitted
+ * master curve's Prony basis — past it additional terms are redundant columns
+ * the data cannot tell apart, which only the smoothing prior fills, so the
+ * slider stops offering them. (Whether the grid is too COARSE for the data is
+ * a separate question the server answers with a caption on the fit figures,
+ * not with this cap.) Cap-only
  * semantics: the server's cap may lower the slider's max, but the max never
  * drops below the CURRENT value. Lowering an `<input type=range>` max below
  * its value makes the DOM clamp the displayed thumb WITHOUT firing an input

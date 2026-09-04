@@ -327,9 +327,11 @@
           detail but can overfit noisy data. This is an upper bound rather than the answer:
           the fit discards terms it does not need, and temperature-domain data is capped
           against the frequency span the ω-T transform produces. After a fit, the slider's
-          maximum drops to the number of terms your data's span and precision can determine
-          at all — beyond it the extra terms would be pure numerical noise. The figure
-          legends and the coefficient table report how many terms the fit actually kept.
+          maximum drops to the number of distinct terms your data's span and precision can
+          carry — beyond it extra terms only duplicate their neighbours and are filled in by
+          the smoothing, not by the data. If the grid is coarser than what your data
+          resolves, the fit figures say so and suggest a size. The figure legends and the
+          coefficient table report how many terms the fit actually kept.
         </HelpPopover>
       </label>
       <div class="nuplot-range-slider u--margin-centered u_centralize_text viz-u-postion__rel">
@@ -910,12 +912,13 @@ const cHasErrorColumns = computed<boolean>(() => {
   );
 });
 
-// The server's eps-rank cap on the grid-size slider, known (like the error
-// columns above) only WITH the fit response, and subject to the same one-
-// request stale window on a file swap. Staleness is harmless here by
-// construction: effectivePronyMax never lets the max drop below the current
-// value, so a stale cap can only fail to restrict — it cannot clamp the
-// thumb or perturb the store value (which the deep refit watcher reads).
+// The server's numerical-rank cap (`max_prony`) on the grid-size slider —
+// past it extra terms are redundant columns only the smoothing fills. Known
+// (like the error columns above) only WITH the fit response, and subject to
+// the same one-request stale window on a file swap. Staleness is harmless
+// here by construction: effectivePronyMax never lets the max drop below the
+// current value, so a stale cap can only fail to restrict — it cannot clamp
+// the thumb or perturb the store value (which the deep refit watcher reads).
 const cServerMaxProny = computed<number | null>(() => {
   const v = dynamfitData.value?.max_prony;
   return Number.isInteger(v) && v >= 1 ? v : null;
