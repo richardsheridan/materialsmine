@@ -44,12 +44,8 @@ import plotly.graph_objects as go
 from app.config import Config
 from app.utils.util import upload_init
 
+from ._paths import DYNAMFIT_DIR, TRIVE_FILES_DIR
 from ._resolution_oracle import exact_probe_terms, fires, run_chart
-
-
-DATA_DIR = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', '..', 'app', 'trive', 'files',
-))
 
 
 class TestUpdateLineChartFrequency(unittest.TestCase):
@@ -57,7 +53,7 @@ class TestUpdateLineChartFrequency(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         cls.uploadData = upload_init(
             'agilus30 (8) master curve 20C.txt', 'frequency',
         )
@@ -203,7 +199,7 @@ class TestUpdateLineChartFrequencyShift(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         cls.uploadData = upload_init(
             'agilus30 (8) master curve 20C.txt', 'frequency',
         )
@@ -331,7 +327,7 @@ class TestUpdateLineChartShiftFigure(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         T = np.linspace(0.0, 80.0, 30)
         cls.temp_data = {
             'Temperature': T,
@@ -530,7 +526,7 @@ class TestUpdateLineChartTemperature(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         # Real temperature ramp for the early-exit path.
         cls.real_temp_data = upload_init(
             'agilus30 (8) Temperature Ramp clean.txt', 'temperature',
@@ -750,7 +746,7 @@ class TestUpdateLineChartCredibleBands(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         cls.uploadData = upload_init(cls.FILE, 'frequency')
         cls.result, cls.fit = cls._run(0.3)
         cls.result_no_basis, cls.fit_no_basis = cls._run(0.3, False)
@@ -1164,7 +1160,7 @@ class TestUpdateLineChartPredictionBands(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         upload = upload_init(cls.FILE, 'frequency')
         cls.result, cls.fit = cls._run(upload, 0.3)
         # Weak smoothing: the display cap bites on some points.
@@ -1428,7 +1424,7 @@ class TestExtendedPronyCurves(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         upload = upload_init(cls.FILE, 'frequency')
         cls.smoothed, cls.smoothed_fit = _chart_and_fit(upload, cls.N, 0.3)
         cls.unsmoothed, cls.unsmoothed_fit = _chart_and_fit(
@@ -1546,7 +1542,7 @@ class TestExtendedFigureAxisPin(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         agilus = upload_init('agilus30 (8) master curve 20C.txt', 'frequency')
         pmma = upload_init('PMMA_shifted_R10_data.txt', 'frequency')
         # Smoothed: both ribbons, and four nonpositive E'' rows whose
@@ -2496,7 +2492,7 @@ class TestUpdateLineChartGridSuggestion(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         cls.uploadData = upload_init(cls.FILE, 'frequency')
 
     def _run(self, N, smoothness, **kwargs):
@@ -2621,7 +2617,7 @@ class TestUpdateLineChartLowSmoothnessGridSuggestion(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Config.FILES_DIRECTORY = DATA_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         cls.uploads = {
             name: upload_init(name, 'frequency')
             for name, *_ in cls.SUPPORTED + cls.UNSUPPORTED}
@@ -2664,10 +2660,7 @@ class TestUpdateLineChartLowSmoothnessDynamfitSilence(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        directory = os.path.abspath(os.path.join(
-            os.path.dirname(__file__), '..', '..', '..', 'app', 'public',
-            'docs', 'dynamfit'))
-        with patch.object(Config, 'FILES_DIRECTORY', directory):
+        with patch.object(Config, 'FILES_DIRECTORY', DYNAMFIT_DIR):
             cls.uploads = {name: upload_init(name, 'frequency')
                            for name, *_ in cls.UNSUPPORTED}
 
