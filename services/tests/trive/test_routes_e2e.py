@@ -46,7 +46,8 @@ from app.trive.calibration import peak_edge_warning
 from app.config import Config
 from app.utils.util import upload_init
 
-from ._route_helpers import make_app, make_token, REAL_FILES_DIR
+from ._paths import TRIVE_FILES_DIR
+from ._route_helpers import make_app, make_token
 
 
 class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
@@ -63,7 +64,7 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._orig_files_dir = Config.FILES_DIRECTORY
-        Config.FILES_DIRECTORY = REAL_FILES_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         Config.SECRET_KEY = 'test-secret'
         cls.app = make_app()
         cls.client = cls.app.test_client()
@@ -207,7 +208,7 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
         for scale in (1.0, 2.0):
             err = 0.1 * a_T * scale  # 10% (then 20%) relative error on a_T
             name = f'_tmp_shift_with_error_x{scale:g}.txt'
-            path = os.path.join(REAL_FILES_DIR, name)
+            path = os.path.join(TRIVE_FILES_DIR, name)
             np.savetxt(path, np.column_stack([T, a_T, err]), delimiter='\t')
             self.addCleanup(os.remove, path)
             resp = self._post({
@@ -241,7 +242,7 @@ class TestExtractRoute(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._orig_files_dir = Config.FILES_DIRECTORY
-        Config.FILES_DIRECTORY = REAL_FILES_DIR
+        Config.FILES_DIRECTORY = TRIVE_FILES_DIR
         Config.SECRET_KEY = 'test-secret'
         cls.app = make_app()
         cls.client = cls.app.test_client()
@@ -630,7 +631,7 @@ class TestExtractRouteErrorColumns(unittest.TestCase):
     """
     Route-level coverage for the optional error columns.
 
-    Every fixture in REAL_FILES_DIR is 3-column, so this class writes its own
+    Every fixture in TRIVE_FILES_DIR is 3-column, so this class writes its own
     4- and 5-column files into a temporary FILES_DIRECTORY.
     """
 
