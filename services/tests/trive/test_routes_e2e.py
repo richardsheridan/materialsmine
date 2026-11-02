@@ -47,6 +47,7 @@ from app.config import Config
 from app.utils.util import upload_init
 
 from ._route_helpers import make_app, make_token, REAL_FILES_DIR
+from ._tc_scan import assert_search_properties
 
 
 class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
@@ -220,6 +221,100 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(json.loads(resp.data)['Ea'], 80.0)
+
+    def _real_table(self, file_name):
+        shift_data = upload_init(file_name, 'shift')
+        return (np.asarray(shift_data['Temperature'], dtype=float),
+                np.asarray(shift_data['a_T'], dtype=float))
+
+    def _post_without_tc(self, file_name, **body):
+        return self._post({
+            'shift_file_name': file_name,
+            'transform_method': 'hybrid',
+            **body,
+        })
+
+    @staticmethod
+    def _searched(result):
+        return tuple(result[k] for k in (
+            'TC', 'C1', 'C2', 'Ea', 'a_T_ref', 'chi2_reduced'))
+
+    def _write_table(self, name, rows):
+        path = os.path.join(REAL_FILES_DIR, name)
+        np.savetxt(path, rows, delimiter='\t')
+        self.addCleanup(os.remove, path)
+
+    def test_hybrid_e2e_without_tc_searches_the_real_tables(self):
+        """
+        Hybrid with no TC on either real table answers with a chosen TC: no
+        exact value is pinned, since chi-squared against Tc on real data is
+        not known to have a single minimum, only that the choice lies between
+        the two best measured temperatures and scores no worse than them.
+        """
+        for name in ('VeroCyan (5) shift factors 80C clean.txt',
+                     'agilus30 (8) shift factors 20C clean.txt'):
+            with self.subTest(file=name):
+                resp = self._post_without_tc(name)
+                self.assertEqual(resp.status_code, 200)
+                result = json.loads(resp.data)
+                self.assertEqual(set(result), {
+                    'transform_method', 'Tg', 'C1', 'C2', 'Ea', 'TC',
+                    'a_T_ref', 'chi2_reduced'})
+                self.assertEqual(result['transform_method'], 'hybrid')
+                self.assertIsNone(result['Tg'])
+                T, a_T = self._real_table(name)
+                assert_search_properties(self, T, a_T, self._searched(result))
+
+    def test_hybrid_e2e_without_tc_holds_values_in_the_body(self):
+        """A value in the body is held through the search, an Ea outside the
+        free-Ea range included, and takes a free parameter off chi2_reduced."""
+        name = 'agilus30 (8) shift factors 20C clean.txt'
+        T, a_T = self._real_table(name)
+        for body, hold in (
+                ({'Ea': 60.0}, {'Ea': 60.0, 'fix_Ea': True}),
+                ({'C1': 14.0, 'C2': 45.0},
+                 {'C1': 14.0, 'C2': 45.0, 'fix_C1': True, 'fix_C2': True})):
+            with self.subTest(body=body):
+                resp = self._post_without_tc(name, **body)
+                self.assertEqual(resp.status_code, 200)
+                assert_search_properties(
+                    self, T, a_T, self._searched(json.loads(resp.data)), **hold)
+
+    def test_hybrid_e2e_without_tc_on_four_rows_fits_at_the_only_candidate(self):
+        name = '_tmp_shift_four_rows.txt'
+        self._write_table(name, [[0.0, 3.0], [10.0, 2.0], [20.0, 1.0],
+                                 [30.0, 0.5]])
+        resp = self._post_without_tc(name)
+        self.assertEqual(resp.status_code, 200)
+        result = json.loads(resp.data)
+        self.assertEqual(result['TC'], 10.0)
+        self.assertIsNone(result['chi2_reduced'])
+
+    def test_hybrid_e2e_without_tc_on_three_rows_returns_400_for_the_search(self):
+        """The refusal is the search's: Tc is no longer a required input."""
+        name = '_tmp_shift_three_rows.txt'
+        self._write_table(name, [[0.0, 3.0], [10.0, 1.0], [20.0, 0.5]])
+        resp = self._post_without_tc(name)
+        self.assertEqual(resp.status_code, 400)
+        message = json.loads(resp.data)['message']
+        self.assertTrue(message)
+        self.assertNotIn('Tc is required', message)
+
+    def test_hybrid_e2e_without_tc_on_one_row_keeps_the_upload_400(self):
+        name = '_tmp_shift_one_row.txt'
+        self._write_table(name, [[0.0, 3.0]])
+        self.assertEqual(self._post_without_tc(name).status_code, 400)
+
+    def test_hybrid_e2e_without_tc_on_duplicate_temperatures_stays_500(self):
+        """An assertion in the fit is not a failed candidate; tied tables stay
+        the 500 they are when a TC is supplied."""
+        name = '_tmp_shift_duplicate_T.txt'
+        rows = [[0.0, 9.0], [0.0, 8.0], [10.0, 4.0], [20.0, 1.0],
+                [30.0, 0.5], [40.0, 0.25], [50.0, 0.1]]
+        self._write_table(name, rows)
+        self.assertEqual(
+            self._post_without_tc(name, TC=20.0).status_code, 500)
+        self.assertEqual(self._post_without_tc(name).status_code, 500)
 
     def test_wlf_e2e_error_column_weights_fit_and_chi2(self):
         """
