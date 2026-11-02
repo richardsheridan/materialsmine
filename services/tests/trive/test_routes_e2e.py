@@ -192,6 +192,35 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
         n = len(T)
         self.assertAlmostEqual(chi2, log_rmse ** 2 * n / (n - 4), places=10)
 
+    def test_hybrid_e2e_in_range_free_Ea_result_does_not_move(self):
+        """
+        VeroCyan at T_C=80 °C has its free Ea optimum well inside
+        [100, 400] kJ/mol, so the Ea bounds leave the stored result alone.
+        """
+        resp = self._post({
+            'shift_file_name': 'VeroCyan (5) shift factors 80C clean.txt',
+            'transform_method': 'hybrid',
+            'TC': 80.0,
+        })
+        self.assertEqual(resp.status_code, 200)
+        result = json.loads(resp.data)
+        np.testing.assert_allclose(
+            [result[k] for k in ('C1', 'C2', 'Ea', 'a_T_ref', 'chi2_reduced')],
+            [6.52281, 17.67855, 268.37107, 9.06991, 0.58959],
+            rtol=1e-4,
+        )
+
+    def test_hybrid_e2e_out_of_range_Ea_in_body_is_held_exactly(self):
+        """An Ea in the body is fixed, not optimized, so the bounds pass it."""
+        resp = self._post({
+            'shift_file_name': 'VeroCyan (5) shift factors 80C clean.txt',
+            'transform_method': 'hybrid',
+            'TC': 80.0,
+            'Ea': 80.0,
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(json.loads(resp.data)['Ea'], 80.0)
+
     def test_wlf_e2e_error_column_weights_fit_and_chi2(self):
         """
         A 3-column shift file (Temperature, a_T, Error) must reach the fit as

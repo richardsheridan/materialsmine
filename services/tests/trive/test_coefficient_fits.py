@@ -154,7 +154,7 @@ class TestFitHybridCoefficients(unittest.TestCase):
     TC = 25.0       # WLF/Arrhenius crossover — required input, never fitted
     C1_TRUE = 14.0
     C2_TRUE = 45.0
-    EA_TRUE = 80.0  # kJ/mol — well within curve_fit's convergence basin
+    EA_TRUE = 200.0  # kJ/mol — inside the free-Ea bounds, away from either
 
     @classmethod
     def setUpClass(cls):
@@ -264,6 +264,91 @@ class TestFitHybridCoefficients(unittest.TestCase):
         self.assertAlmostEqual(C2_fit, self.C2_TRUE, places=4)
         self.assertAlmostEqual(Ea_fit, self.EA_TRUE, places=4)
         self.assertAlmostEqual(a_T_ref, 1.0, places=4)
+
+
+class TestHybridEaBounds(unittest.TestCase):
+    """A free Ea is optimized within [100, 400] kJ/mol, bounds included; a
+    fixed Ea is not optimized, so the bounds do not apply to it."""
+
+    TC = 25.0
+    C1_TRUE = 14.0
+    C2_TRUE = 45.0
+    EA_MIN = 100.0
+    EA_MAX = 400.0
+    # A solver may stop just inside an active bound, never outside it.
+    AT_BOUND = 1e-3  # kJ/mol
+
+    @classmethod
+    def setUpClass(cls):
+        cls.T = np.linspace(5.0, 70.0, 30)
+
+    def _data(self, Ea):
+        return hybrid_shift(self.T, self.TC, self.C1_TRUE, self.C2_TRUE, Ea)
+
+    def _fit(self, Ea_true, **kwargs):
+        return fit_hybrid_coefficients(
+            self.T, self._data(Ea_true), self.TC,
+            C1=self.C1_TRUE, C2=self.C2_TRUE, **kwargs,
+        )
+
+    def _assert_at_bound(self, Ea_fit, bound):
+        self.assertGreaterEqual(Ea_fit, self.EA_MIN)
+        self.assertLessEqual(Ea_fit, self.EA_MAX)
+        self.assertAlmostEqual(Ea_fit, bound, delta=self.AT_BOUND)
+
+    def test_free_Ea_optimum_below_range_returns_lower_bound(self):
+        """Data whose optimum Ea is 60 fits at the 100 kJ/mol bound."""
+        _, _, Ea_fit, _ = self._fit(60.0)
+        self._assert_at_bound(Ea_fit, self.EA_MIN)
+
+    def test_free_Ea_optimum_above_range_returns_upper_bound(self):
+        """Data whose optimum Ea is 600 fits at the 400 kJ/mol bound."""
+        _, _, Ea_fit, _ = self._fit(600.0)
+        self._assert_at_bound(Ea_fit, self.EA_MAX)
+
+    def test_other_coefficients_are_optimized_against_the_active_bound(self):
+        """A fit stopped at a bound equals the fit with Ea fixed there, so the
+        bound constrains the optimization, not only the reported Ea. A free
+        Ea counts as a parameter even at its bound, so chi2 keeps nu = n - 4
+        where the Ea-held fit has nu = n - 3."""
+        n = self.T.size
+        for Ea_true, bound in ((60.0, self.EA_MIN), (600.0, self.EA_MAX)):
+            with self.subTest(Ea_true=Ea_true):
+                C1_fit, C2_fit, _, a_T_ref, chi2 = self._fit(
+                    Ea_true, return_quality=True)
+                C1_held, C2_held, _, a_T_ref_held, chi2_held = self._fit(
+                    Ea_true, Ea=bound, fix_Ea=True, return_quality=True)
+                np.testing.assert_allclose(
+                    [C1_fit, C2_fit, a_T_ref],
+                    [C1_held, C2_held, a_T_ref_held],
+                    rtol=1e-2,
+                )
+                np.testing.assert_allclose(
+                    chi2, chi2_held * (n - 3) / (n - 4), rtol=1e-2)
+
+    def test_out_of_range_initial_guess_is_clipped_into_range(self):
+        """A free Ea guess outside the bounds is a start point, not an error:
+        the fit still finds an in-range optimum and still stops at a bound."""
+        cases = (
+            (50.0, 200.0, 200.0),
+            (900.0, 200.0, 200.0),
+            (50.0, 60.0, self.EA_MIN),
+            (900.0, 600.0, self.EA_MAX),
+        )
+        for guess, Ea_true, expected in cases:
+            with self.subTest(guess=guess, Ea_true=Ea_true):
+                _, _, Ea_fit, _ = self._fit(Ea_true, Ea=guess)
+                self.assertAlmostEqual(
+                    Ea_fit, expected, delta=self.AT_BOUND)
+
+    def test_fixed_out_of_range_Ea_is_returned_exactly(self):
+        """fix_Ea holds any supplied value, inside the bounds or not."""
+        for Ea in (80.0, 500.0):
+            with self.subTest(Ea=Ea):
+                C1_fit, C2_fit, Ea_fit, _ = self._fit(Ea, Ea=Ea, fix_Ea=True)
+                self.assertEqual(Ea_fit, Ea)
+                self.assertAlmostEqual(C1_fit, self.C1_TRUE, places=4)
+                self.assertAlmostEqual(C2_fit, self.C2_TRUE, places=4)
 
 
 class TestHybridOffsetFarFromTC(unittest.TestCase):
