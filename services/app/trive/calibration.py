@@ -483,9 +483,10 @@ def search_hybrid_tc(
     On the ascending table the candidates are the measured temperatures T[1]
     through T[n-3], which keeps two points on either side (a point at Tc is on
     the cold side). Each is scored by fit_hybrid_coefficients' weighted
-    chi-squared sum, and a bounded 1D optimizer refines between the two lowest,
-    adjacent or not. A candidate or refinement probe whose fit fails is passed
-    over. The result is never worse than the best candidate.
+    chi-squared sum, and a bounded 1D optimizer refines across the best one's
+    left and right neighbours on that grid, however they scored, or to its one
+    neighbour at an end of the grid. A candidate or refinement probe whose fit
+    fails is passed over. The result is never worse than the best candidate.
 
     Parameters:
         T (numpy.ndarray): 1-D array of temperatures in °C, in either order.
@@ -538,16 +539,18 @@ def search_hybrid_tc(
 
     candidates = T[1:n - 2]
     fits = [fit_at(TC) for TC in candidates]
-    fits = sorted((f for f in fits if f is not None), key=lambda f: f[0])
-    if not fits:
+    scored = [i for i, fit in enumerate(fits) if fit is not None]
+    if not scored:
         raise ValueError(
             f"No candidate Tc gave a hybrid fit: {failures[-1]}")
 
-    best = fits[0]
-    if len(fits) > 1:
+    i_best = min(scored, key=lambda i: fits[i][0])
+    best = fits[i_best]
+    if len(candidates) > 1:
         refined = minimize_scalar(
             objective_at,
-            bounds=sorted((fits[0][1], fits[1][1])),
+            bounds=(candidates[max(i_best - 1, 0)],
+                    candidates[min(i_best + 1, len(candidates) - 1)]),
             method='bounded',
         )
         fit = fit_at(refined.x)
