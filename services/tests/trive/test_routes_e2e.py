@@ -249,7 +249,7 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
         Hybrid with no TC on either real table answers with a chosen TC: no
         exact value is pinned, since chi-squared against Tc on real data is
         not known to have a single minimum, only that the choice lies between
-        the two best measured temperatures and scores no worse than them.
+        the best candidate's grid neighbours and scores no worse than it.
         """
         for name in ('VeroCyan (5) shift factors 80C clean.txt',
                      'agilus30 (8) shift factors 20C clean.txt'):
@@ -279,6 +279,20 @@ class TestFitShiftCoefficientsEndToEnd(unittest.TestCase):
                 self.assertEqual(resp.status_code, 200)
                 assert_search_properties(
                     self, T, a_T, self._searched(json.loads(resp.data)), **hold)
+
+    def test_hybrid_e2e_without_tc_refines_away_from_the_second_best(self):
+        """A noiseless true Tc of 27.3 sits below the best temperature, 28,
+        whose second best, 30, is above it: the answer is the true Tc."""
+        name = '_tmp_shift_tc_below_best.txt'
+        T = np.array([-20.0, -10.0, 0.0, 15.0, 28.0, 30.0, 40.0, 50.0, 60.0,
+                      70.0, 80.0, 90.0])
+        a_T = hybrid_shift(T, 27.3, 14.0, 45.0, 120.0)
+        self._write_table(name, np.column_stack((T, a_T)))
+        resp = self._post_without_tc(name)
+        self.assertEqual(resp.status_code, 200)
+        result = json.loads(resp.data)
+        self.assertAlmostEqual(result['TC'], 27.3, delta=0.1)
+        assert_search_properties(self, T, a_T, self._searched(result))
 
     def test_hybrid_e2e_without_tc_on_four_rows_fits_at_the_only_candidate(self):
         name = '_tmp_shift_four_rows.txt'

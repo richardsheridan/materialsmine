@@ -32,12 +32,26 @@ def chi2_sum(T, a_T, TC, C1, C2, Ea, a_T_ref, sigma_a_T=None):
     return float(resid @ resid)
 
 
+def candidate_grid(T):
+    """The measured temperatures with two points on either side of them
+    (T <= Tc is cold), ascending."""
+    return np.sort(T)[1:len(T) - 2]
+
+
+def grid_neighbours(T, TC):
+    """(low, high) ends of the refinement interval around candidate TC: the
+    adjacent candidates, however they scored, or TC itself at an end of the
+    grid."""
+    grid = candidate_grid(T)
+    i = int(np.flatnonzero(grid == TC)[0])
+    return float(grid[max(i - 1, 0)]), float(grid[min(i + 1, len(grid) - 1)])
+
+
 def scan_candidates(T, a_T, sigma_a_T=None, **hold):
-    """(objective, Tc) of each measured temperature with two points on either
-    side of it (T <= Tc is cold), best first, skipping candidates whose fit
-    raises."""
+    """(objective, Tc) of each candidate, best first, skipping candidates whose
+    fit raises."""
     scan = []
-    for TC in T[1:len(T) - 2]:
+    for TC in candidate_grid(T):
         try:
             C1, C2, Ea, a_T_ref = fit_hybrid_coefficients(
                 T, a_T, TC, sigma_a_T=sigma_a_T, **hold)
@@ -49,16 +63,17 @@ def scan_candidates(T, a_T, sigma_a_T=None, **hold):
 
 
 def assert_search_properties(test, T, a_T, result, sigma_a_T=None, **hold):
-    """A searched (TC, C1, C2, Ea, a_T_ref, chi2_reduced) lies between the two
-    best candidates, beats or ties all of them, keeps two points on either
-    side, and reports chi-squared with Tc counted as a free parameter."""
+    """A searched (TC, C1, C2, Ea, a_T_ref, chi2_reduced) lies between the best
+    candidate's grid neighbours, beats or ties every candidate, keeps two
+    points on either side, and reports chi-squared with Tc counted as a free
+    parameter."""
     TC, C1, C2, Ea, a_T_ref, chi2_reduced = result
-    (best, best_TC), (_, second_TC) = scan_candidates(
-        T, a_T, sigma_a_T, **hold)[:2]
+    best, best_TC = scan_candidates(T, a_T, sigma_a_T, **hold)[0]
+    low, high = grid_neighbours(T, best_TC)
     objective = chi2_sum(T, a_T, TC, C1, C2, Ea, a_T_ref, sigma_a_T)
 
-    test.assertGreaterEqual(TC, min(best_TC, second_TC))
-    test.assertLessEqual(TC, max(best_TC, second_TC))
+    test.assertGreaterEqual(TC, low)
+    test.assertLessEqual(TC, high)
     test.assertLessEqual(
         objective, best * (1.0 + OBJECTIVE_SLACK) + OBJECTIVE_FLOOR)
     test.assertGreaterEqual(int(np.sum(T <= TC)), 2)

@@ -29,7 +29,12 @@ from app.trive.shift import (
 from app.trive.calibration import fit_wlf_coefficients, fit_hybrid_coefficients
 import app.trive as trive
 
-from ._tc_scan import assert_search_properties, chi2_sum, scan_candidates
+from ._tc_scan import (
+    assert_search_properties,
+    candidate_grid,
+    chi2_sum,
+    scan_candidates,
+)
 
 
 class TestFitWlfCoefficients(unittest.TestCase):
@@ -357,7 +362,8 @@ class TestHybridEaBounds(unittest.TestCase):
 
 class TestSearchHybridTc(unittest.TestCase):
     """search_hybrid_tc chooses Tc from the table's measured temperatures,
-    keeping two points on either side, then refines between the two best."""
+    keeping two points on either side, then refines across the best one's
+    left and right neighbours on that grid."""
 
     C1_TRUE = 14.0
     C2_TRUE = 45.0
@@ -423,8 +429,9 @@ class TestSearchHybridTc(unittest.TestCase):
             fix_C1=True, fix_C2=True, fix_Ea=True)
 
     def test_noisy_table_result_has_the_search_properties(self):
-        """Between the two best candidates, no worse than any of them, and
-        chi2_reduced over n - (5 - fixes), for any set of held values."""
+        """Between the best candidate's neighbours, no worse than any
+        candidate, and chi2_reduced over n - (5 - fixes), for any set of held
+        values."""
         for hold in ({},
                      {'Ea': 150.0, 'fix_Ea': True},
                      {'C1': 14.0, 'fix_C1': True},
@@ -437,21 +444,95 @@ class TestSearchHybridTc(unittest.TestCase):
                 assert_search_properties(
                     self, self.T_NOISY, self.a_T_noisy, result, **hold)
 
-    def test_refinement_runs_between_two_best_even_when_not_adjacent(self):
-        """The interval is the two lowest candidates taken literally, so a
-        lower objective just outside it is not reached."""
+    def test_refinement_reaches_side_away_from_an_adjacent_second_best(self):
+        """A noiseless true Tc beside the best candidate is recovered when the
+        second best is the neighbour on the other side of the best."""
+        cold = [-20.0, -10.0, 0.0]
+        hot = [50.0, 60.0, 70.0, 80.0, 90.0]
+        for middle, expected_best, expected_second in (
+                ([15.0, 28.0, 30.0, 40.0], 28.0, 30.0),
+                ([10.0, 25.0, 27.0, 40.0], 27.0, 25.0)):
+            with self.subTest(middle=middle):
+                T = np.array(cold + middle + hot)
+                a_T = hybrid_shift(T, self.TC_OFF_GRID, self.C1_TRUE,
+                                   self.C2_TRUE, self.EA_TRUE)
+                (_, best_TC), (_, second_TC) = scan_candidates(T, a_T)[:2]
+                self.assertEqual(
+                    (best_TC, second_TC), (expected_best, expected_second))
+
+                result = trive.search_hybrid_tc(T, a_T)
+                self.assertAlmostEqual(
+                    result[0], self.TC_OFF_GRID, delta=self.TC_RECOVERY)
+                assert_search_properties(self, T, a_T, result)
+
+    def test_refinement_reaches_a_dip_away_from_a_distant_second_best(self):
+        """The second best lies two grid steps above the best, and the lower
+        objective is just below the best, inside its left neighbour."""
         T = np.arange(0.0, 76.0, 5.0)
         rng = np.random.RandomState(0)
         a_T = hybrid_shift(T, 30.0, self.C1_TRUE, self.C2_TRUE, 150.0) \
             * 10.0 ** (0.6 * rng.randn(len(T)))
         (best, best_TC), (_, second_TC) = scan_candidates(T, a_T)[:2]
         self.assertEqual((best_TC, second_TC), (20.0, 30.0))
-        # The fixture only tells the readings apart if this dip exists.
-        outside = fit_hybrid_coefficients(T, a_T, 19.5)
-        self.assertLess(chi2_sum(T, a_T, 19.5, *outside), best)
 
         result = trive.search_hybrid_tc(T, a_T)
+        self.assertLess(result[0], best_TC)
+        self.assertLess(chi2_sum(T, a_T, *result[:5]), best)
         assert_search_properties(self, T, a_T, result)
+
+    def test_refinement_stops_at_the_only_neighbour_at_an_end_of_the_grid(self):
+        """The best candidate first or last on the grid refines toward its one
+        neighbour, so a lower objective past that neighbour is not reached,
+        even at a second best further along the grid."""
+        for n, seed, amplitude, TC_true, end, neighbour, second in (
+                (12, 424, 0.6, 10.0, 0, 1, 30.0),
+                (10, 224, 0.3, 30.0, -1, -2, 25.0)):
+            with self.subTest(end=end):
+                T = np.arange(0.0, n * 5.0, 5.0)
+                rng = np.random.RandomState(seed)
+                a_T = hybrid_shift(
+                    T, TC_true, self.C1_TRUE, self.C2_TRUE, 150.0,
+                ) * 10.0 ** (amplitude * rng.randn(n))
+                grid = candidate_grid(T)
+                (_, best_TC), (_, second_TC) = scan_candidates(T, a_T)[:2]
+                self.assertEqual((best_TC, second_TC), (grid[end], second))
+
+                result = trive.search_hybrid_tc(T, a_T)
+                self.assertGreaterEqual(
+                    result[0], min(grid[end], grid[neighbour]))
+                self.assertLessEqual(
+                    result[0], max(grid[end], grid[neighbour]))
+                assert_search_properties(self, T, a_T, result)
+
+    def test_refinement_at_an_end_of_the_grid_finds_tc_in_the_interval(self):
+        """A noiseless true Tc between an end candidate and its one neighbour
+        is recovered from either end."""
+        grid = candidate_grid(self.T)
+        for TC_true, expected_best in ((grid[0] + 1.5, grid[0]),
+                                       (grid[-1] - 1.0, grid[-1])):
+            with self.subTest(TC_true=TC_true):
+                a_T = self._table(TC_true)
+                self.assertEqual(scan_candidates(self.T, a_T)[0][1],
+                                 expected_best)
+                result = trive.search_hybrid_tc(self.T, a_T)
+                self.assertAlmostEqual(
+                    result[0], TC_true, delta=self.TC_RECOVERY)
+                assert_search_properties(self, self.T, a_T, result)
+
+    def test_a_neighbour_whose_fit_fails_still_bounds_the_refinement(self):
+        """Neighbours are adjacent on the grid however they scored: with these
+        C1 and C2 held the 35 degC fit raises, yet refinement around the best
+        candidate, 40 degC, still reaches the true Tc on that side of it."""
+        T = np.arange(0.0, 71.0, 5.0)
+        hold = {'C1': -400.0, 'C2': 10.0, 'fix_C1': True, 'fix_C2': True}
+        a_T = hybrid_shift(T, 39.0, -400.0, 10.0, 150.0)
+        scan = scan_candidates(T, a_T, **hold)
+        self.assertEqual((scan[0][1], scan[1][1]), (40.0, 45.0))
+        self.assertNotIn(35.0, [TC for _, TC in scan])
+
+        result = trive.search_hybrid_tc(T, a_T, **hold)
+        self.assertAlmostEqual(result[0], 39.0, delta=self.TC_RECOVERY)
+        assert_search_properties(self, T, a_T, result, **hold)
 
     def test_result_is_never_worse_than_the_best_candidate(self):
         """Noiseless data whose true Tc is a measured temperature cannot be
