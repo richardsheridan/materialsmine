@@ -319,7 +319,7 @@ def fit_hybrid_coefficients(
     Individual parameters can be fixed at their supplied values by setting the
     corresponding fix_* flag. A supplied-but-not-fixed value becomes the
     initial guess; otherwise the WLF universal constants are used for C1/C2 and
-    a moderate activation energy (100 kJ/mol) for Ea. Fixed parameters are held
+    the low end of its range (100 kJ/mol) for Ea. Fixed parameters are held
     constant by closing them over inside the model rather than passing them to
     curve_fit.
 
@@ -376,7 +376,7 @@ def fit_hybrid_coefficients(
     assert np.all(np.isfinite(T)), "T must contain only finite values"
     sigma = _sigma_log10(a_T, sigma_a_T)
 
-    _EA_DEFAULT = 100.0  # kJ/mol — broad mid-range starting point
+    _EA_DEFAULT = 100.0  # kJ/mol — low end of the free-Ea range
     C1_0 = C1 if C1 is not None else UNIVERSAL_WLF_C1
     C2_0 = C2 if C2 is not None else UNIVERSAL_WLF_C2
     Ea_0 = Ea if Ea is not None else _EA_DEFAULT
@@ -428,8 +428,10 @@ def fit_hybrid_coefficients(
           if not fixed]
 
     # C2 floored at 1.0 to stay off the WLF pole.
-    lb = [{'C2': 1.0, 'Ea': _EA_MIN}.get(n, -np.inf) for n in free_names]
-    ub = [_EA_MAX if n == 'Ea' else np.inf for n in free_names]
+    lower = {'C2': 1.0, 'Ea': _EA_MIN}
+    upper = {'Ea': _EA_MAX}
+    lb = [lower.get(n, -np.inf) for n in free_names]
+    ub = [upper.get(n, np.inf) for n in free_names]
 
     def model(T_arg, *free_vals):
         vals = dict(zip(free_names, free_vals))

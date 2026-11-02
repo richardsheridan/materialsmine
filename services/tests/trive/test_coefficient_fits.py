@@ -4,8 +4,8 @@ Shift-coefficient calibration: `fit_wlf_coefficients` (recovers C1/C2) and
 Both co-fit the a_T_ref offset — the data's shift factor at the model's anchor.
 
 Pure functions running the real optimizer on small synthetic data — no Flask
-app, no disk. Run when changing the fit math, the pole-avoidance bounds, or the
-degenerate-segment guards.
+app, no disk. Run when changing the fit math, the pole-avoidance bounds, the
+free-Ea bounds, or the degenerate-segment guards.
 
     python -m unittest tests.trive.test_coefficient_fits
 """
@@ -356,7 +356,8 @@ class TestHybridOffsetFarFromTC(unittest.TestCase):
     many decades away from TC fits as accurately as data referenced near it."""
 
     TC = 25.0
-    # Coefficients the fit is seeded with (and pinned to when fixed). The data
+    # Coefficients the fit is seeded with (and pinned to when fixed; a free
+    # EA seed is clipped into its bounds first). The data
     # below is generated with different ones plus noise, so the optimum
     # offset is not simply the data's value at TC.
     C1 = 14.0

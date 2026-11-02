@@ -330,7 +330,8 @@ def fit_shift_coefficients(request_id):
     WLF requires Tg (the a_T == 1 anchor); hybrid requires TC. Both are
     upstream-supplied inputs — this route does not load the main viscoelastic
     data file and so cannot estimate them. Supplying any of C1/C2/Ea holds that
-    coefficient fixed instead of fitting it.
+    coefficient fixed instead of fitting it; a fitted hybrid Ea stays within
+    the range fit_hybrid_coefficients documents.
 
     Both fits co-fit a vertical reference offset, surfaced as a_T_ref: the
     data's shift factor at the model's anchor (Tg for WLF, TC for hybrid), and
