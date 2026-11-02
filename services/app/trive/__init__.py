@@ -27,7 +27,8 @@ bottom-up:
 
     shift        WLF / Arrhenius / hybrid shift factors and their inverses
     calibration  the reverse direction — fitting C1/C2/Ea to measured shift
-                 data, and the peak finder that estimates Tg and TC
+                 data, searching for a hybrid TC when none is given, and the
+                 peak finder that estimates Tg and TC
     tts          applying a shift model to a data frame, both directions
 
     figures      plotly figures, their captions, the uncertainty ribbons and
@@ -106,13 +107,13 @@ __all__ = [
     'inverse_hybrid_shift',
     'inverse_wlf_shift',
     'peak_edge_warning',
-    'search_hybrid_tc',
     'prony_basis',
     'prony_noise_ceiling',
     'prony_rank_limit',
     'prony_resolution',
     'prony_relaxation_space',
     'prony_terms_for_span',
+    'search_hybrid_tc',
     'smooth_prony_fit',
     'tts_frequency_to_temperature',
     'tts_frequency_to_temperature_V2',

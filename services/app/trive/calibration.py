@@ -1,6 +1,7 @@
 """
 Deriving shift-model parameters from measured data: the C1/C2/Ea curve fits
-behind the /fit-shift/ route, and the peak finder the /extract/ route uses to
+and hybrid Tc search behind the /fit-shift/ route, and the peak finder
+the /extract/ route uses to
 estimate Tg (tan-δ peak) and TL (E'' peak).
 
 The inverse of `shift`: that module evaluates a_T given coefficients, this one
@@ -309,8 +310,9 @@ def fit_hybrid_coefficients(
 
     Uses scipy.optimize.curve_fit in log10(a_T) space so that points spanning
     many decades of shift factor receive uniform weight. TC is required and is
-    never optimized (search_hybrid_tc chooses one by repeating this fit) — it is produced upstream by the E-loss-peak logic in the
-    extract step and is a physical input, not a fit parameter. The data's
+    never optimized here: it is the caller's, either a physical input such as
+    the extract step's E-loss-peak estimate or a candidate from
+    search_hybrid_tc, which chooses TC by repeating this fit. The data's
     shift factor at TC, a_T_ref, is always co-fitted as a vertical offset and,
     as in fit_wlf_coefficients, carried through the optimizer as
     log10(a_T_ref), so data referenced decades away from TC fits as well as
@@ -513,6 +515,8 @@ def search_hybrid_tc(
     if sigma_a_T is not None:
         sigma_a_T = np.atleast_1d(sigma_a_T)[order]
 
+    failures = []
+
     def fit_at(TC):
         """(objective, TC, C1, C2, Ea, a_T_ref), or None if the fit fails."""
         try:
@@ -532,7 +536,6 @@ def search_hybrid_tc(
         fit = fit_at(TC)
         return np.inf if fit is None else fit[0]
 
-    failures = []
     candidates = T[1:n - 2]
     fits = [fit_at(TC) for TC in candidates]
     fits = sorted((f for f in fits if f is not None), key=lambda f: f[0])

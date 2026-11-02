@@ -2,7 +2,8 @@
 Fast route-wiring tests for the Tri-VE Flask endpoints.
 
 Everything external is mocked at the route-module boundary (check_file_exists,
-upload_init, fit_wlf_coefficients, fit_hybrid_coefficients, search_hybrid_tc), so these tests
+upload_init, fit_wlf_coefficients, fit_hybrid_coefficients,
+search_hybrid_tc), so these tests
 never touch disk or run the optimizer. They verify request parsing, the
 response envelope, parameter pass-through (e.g. fix_C1), and the
 validation/short-circuit error codes — NOT the fit math (see
@@ -55,9 +56,11 @@ class TestFitShiftCoefficientsRoute(unittest.TestCase):
       - Patch Config.SECRET_KEY so token_required decodes our test tokens.
       - Patch check_file_exists and upload_init at the route module boundary so
         tests never touch disk and don't depend on real file content.
-      - Patch fit_wlf_coefficients, fit_hybrid_coefficients and search_hybrid_tc so tests verify
-        route wiring, not fit math (fit math is covered in TestFitWlfCoefficients
-        and TestFitHybridCoefficients in test_coefficient_fits).
+      - Patch fit_wlf_coefficients, fit_hybrid_coefficients and
+        search_hybrid_tc so tests verify
+        route wiring, not fit math (fit math is covered in TestFitWlfCoefficients,
+        TestFitHybridCoefficients and TestSearchHybridTc in
+        test_coefficient_fits).
     """
 
     @classmethod

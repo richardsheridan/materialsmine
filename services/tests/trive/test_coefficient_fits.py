@@ -6,7 +6,7 @@ Both co-fit the a_T_ref offset — the data's shift factor at the model's anchor
 
 Pure functions running the real optimizer on small synthetic data — no Flask
 app, no disk. Run when changing the fit math, the pole-avoidance bounds, the
-free-Ea bounds, or the degenerate-segment guards.
+free-Ea bounds, the Tc search, or the degenerate-segment guards.
 
     python -m unittest tests.trive.test_coefficient_fits
 """

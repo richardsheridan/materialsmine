@@ -327,7 +327,8 @@ def fit_shift_coefficients(request_id):
     (chi2_reduced; None when there are no surplus degrees of freedom) — no
     Prony fit, no charts.
 
-    WLF requires Tg (the a_T == 1 anchor), an upstream-supplied input — this route does not load the main viscoelastic
+    WLF requires Tg (the a_T == 1 anchor), an upstream-supplied input — this
+    route does not load the main viscoelastic
     data file and so cannot estimate it. Hybrid fits at a supplied TC; without
     one, search_hybrid_tc chooses it from the table and the response reports
     the choice. Supplying any of C1/C2/Ea holds that
@@ -387,7 +388,7 @@ def fit_shift_coefficients(request_id):
                 'chi2_reduced': chi2_reduced,
             }
         else:  # hybrid
-            held = dict(
+            fit_inputs = dict(
                 C1=C1, C2=C2, Ea=Ea,
                 fix_C1=(C1 is not None),
                 fix_C2=(C2 is not None),
@@ -396,10 +397,10 @@ def fit_shift_coefficients(request_id):
             )
             if TC is None:
                 TC, C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced = search_hybrid_tc(
-                    T, a_T, **held)
+                    T, a_T, **fit_inputs)
             else:
                 C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced = fit_hybrid_coefficients(
-                    T, a_T, TC=TC, **held, return_quality=True)
+                    T, a_T, TC=TC, **fit_inputs, return_quality=True)
             result_data = {
                 'transform_method': 'hybrid',
                 'Tg': None, 'C1': C1_fit, 'C2': C2_fit,
