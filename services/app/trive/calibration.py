@@ -9,7 +9,7 @@ that points spanning many decades of shift factor carry equal weight.
 """
 
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize_scalar
 from scipy.signal import find_peaks
 
 from .shift import hybrid_shift, UNIVERSAL_WLF_C1, UNIVERSAL_WLF_C2, wlf_log10_shift
@@ -309,7 +309,7 @@ def fit_hybrid_coefficients(
 
     Uses scipy.optimize.curve_fit in log10(a_T) space so that points spanning
     many decades of shift factor receive uniform weight. TC is required and is
-    never optimized — it is produced upstream by the E-loss-peak logic in the
+    never optimized (search_hybrid_tc chooses one by repeating this fit) — it is produced upstream by the E-loss-peak logic in the
     extract step and is a physical input, not a fit parameter. The data's
     shift factor at TC, a_T_ref, is always co-fitted as a vertical offset and,
     as in fit_wlf_coefficients, carried through the optimizer as
@@ -461,6 +461,101 @@ def fit_hybrid_coefficients(
     n_free = 4 - int(fix_C1) - int(fix_C2) - int(fix_Ea)  # a_T_ref always free
     chi2 = _shift_chi2_reduced(log10_model - log10_a_T, sigma, n_free)
     return C1_fit, C2_fit, Ea_fit, a_T_ref_fit, chi2
+
+
+def search_hybrid_tc(
+        T: np.ndarray,
+        a_T: np.ndarray,
+        C1: float = None,
+        C2: float = None,
+        Ea: float = None,
+        fix_C1: bool = False,
+        fix_C2: bool = False,
+        fix_Ea: bool = False,
+        *,
+        sigma_a_T: np.ndarray = None,
+) -> tuple:
+    """
+    Choose Tc for a hybrid fit, then fit the coefficients at it.
+
+    On the ascending table the candidates are the measured temperatures T[1]
+    through T[n-3], which keeps two points on either side (a point at Tc is on
+    the cold side). Each is scored by fit_hybrid_coefficients' weighted
+    chi-squared sum, and a bounded 1D optimizer refines between the two lowest,
+    adjacent or not. A candidate or refinement probe whose fit fails is passed
+    over. The result is never worse than the best candidate.
+
+    Parameters:
+        T (numpy.ndarray): 1-D array of temperatures in °C, in either order.
+        a_T (numpy.ndarray): 1-D array of positive shift factors (linear scale).
+        C1, C2, Ea, fix_C1, fix_C2, fix_Ea, sigma_a_T: as for
+            fit_hybrid_coefficients, and applied to every fit in the search.
+
+    Returns:
+        tuple: (TC, C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced). Unless the
+            table has a single candidate, chi2_reduced counts Tc as a free
+            parameter; it is None when the degrees of freedom are not positive.
+
+    Raises:
+        ValueError: If T has fewer than 4 rows, or if every candidate fit fails.
+    """
+    T = np.atleast_1d(T)
+    a_T = np.atleast_1d(a_T)
+    assert len(T) == len(a_T), \
+        f"T and a_T must have the same length; got {len(T)} and {len(a_T)}"
+    n = len(T)
+    if n < 4:
+        raise ValueError(
+            f"Choosing Tc needs at least 4 shift factor rows, two on either "
+            f"side of it; got {n}. Supply Tc or add temperatures.")
+    order = np.argsort(T)
+    T, a_T = T[order], a_T[order]
+    if sigma_a_T is not None:
+        sigma_a_T = np.atleast_1d(sigma_a_T)[order]
+
+    def fit_at(TC):
+        """(objective, TC, C1, C2, Ea, a_T_ref), or None if the fit fails."""
+        try:
+            fitted = fit_hybrid_coefficients(
+                T, a_T, TC, C1, C2, Ea, fix_C1, fix_C2, fix_Ea,
+                sigma_a_T=sigma_a_T)
+            C1_fit, C2_fit, Ea_fit, a_T_ref = fitted
+            resid = (np.log10(hybrid_shift(T, TC, C1_fit, C2_fit, Ea_fit))
+                     + np.log10(a_T_ref) - np.log10(a_T))
+        except (ValueError, RuntimeError) as err:
+            failures.append(err)
+            return None
+        scaled = resid / _sigma_log10(a_T, sigma_a_T)
+        return (float(scaled @ scaled), float(TC), *fitted)
+
+    def objective_at(TC):
+        fit = fit_at(TC)
+        return np.inf if fit is None else fit[0]
+
+    failures = []
+    candidates = T[1:n - 2]
+    fits = [fit_at(TC) for TC in candidates]
+    fits = sorted((f for f in fits if f is not None), key=lambda f: f[0])
+    if not fits:
+        raise ValueError(
+            f"No candidate Tc gave a hybrid fit: {failures[-1]}")
+
+    best = fits[0]
+    if len(fits) > 1:
+        refined = minimize_scalar(
+            objective_at,
+            bounds=sorted((fits[0][1], fits[1][1])),
+            method='bounded',
+        )
+        fit = fit_at(refined.x)
+        if fit is not None and fit[0] < best[0]:
+            best = fit
+
+    n_free = 4 - int(fix_C1) - int(fix_C2) - int(fix_Ea)  # a_T_ref always free
+    if len(candidates) > 1:
+        n_free += 1  # Tc was chosen from the data as well
+    dof = n - n_free
+    return (*best[1:], best[0] / dof if dof > 0 else None)
 
 
 def argmax_peak(signal: np.ndarray) -> int:

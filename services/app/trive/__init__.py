@@ -51,6 +51,7 @@ from .calibration import (  # noqa: E402
     fit_hybrid_coefficients,
     fit_wlf_coefficients,
     peak_edge_warning,
+    search_hybrid_tc,
 )
 from .chart import EXPECTED_DOMAIN_COLUMNS, update_line_chart  # noqa: E402
 from .fit import smooth_prony_fit  # noqa: E402
@@ -105,6 +106,7 @@ __all__ = [
     'inverse_hybrid_shift',
     'inverse_wlf_shift',
     'peak_edge_warning',
+    'search_hybrid_tc',
     'prony_basis',
     'prony_noise_ceiling',
     'prony_rank_limit',

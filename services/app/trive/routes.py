@@ -9,7 +9,7 @@ from flask import request, Blueprint, jsonify,  Response
 from app.trive import (
     update_line_chart, argmax_peak, peak_edge_warning,
     UNIVERSAL_WLF_C1, UNIVERSAL_WLF_C2,
-    fit_wlf_coefficients, fit_hybrid_coefficients,
+    fit_wlf_coefficients, fit_hybrid_coefficients, search_hybrid_tc,
 )
 from app.utils.util import token_required, upload_init, request_logger, log_errors
 from app.config import Config
@@ -327,9 +327,10 @@ def fit_shift_coefficients(request_id):
     (chi2_reduced; None when there are no surplus degrees of freedom) — no
     Prony fit, no charts.
 
-    WLF requires Tg (the a_T == 1 anchor); hybrid requires TC. Both are
-    upstream-supplied inputs — this route does not load the main viscoelastic
-    data file and so cannot estimate them. Supplying any of C1/C2/Ea holds that
+    WLF requires Tg (the a_T == 1 anchor), an upstream-supplied input — this route does not load the main viscoelastic
+    data file and so cannot estimate it. Hybrid fits at a supplied TC; without
+    one, search_hybrid_tc chooses it from the table and the response reports
+    the choice. Supplying any of C1/C2/Ea holds that
     coefficient fixed instead of fitting it; a fitted hybrid Ea stays within
     the range fit_hybrid_coefficients documents.
 
@@ -386,17 +387,19 @@ def fit_shift_coefficients(request_id):
                 'chi2_reduced': chi2_reduced,
             }
         else:  # hybrid
-            if TC is None:
-                return jsonify({'message': 'Tc is required for hybrid coefficient fitting'}), 400
-            C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced = fit_hybrid_coefficients(
-                T, a_T, TC=TC,
+            held = dict(
                 C1=C1, C2=C2, Ea=Ea,
                 fix_C1=(C1 is not None),
                 fix_C2=(C2 is not None),
                 fix_Ea=(Ea is not None),
                 sigma_a_T=sigma_a_T,
-                return_quality=True,
             )
+            if TC is None:
+                TC, C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced = search_hybrid_tc(
+                    T, a_T, **held)
+            else:
+                C1_fit, C2_fit, Ea_fit, a_T_ref, chi2_reduced = fit_hybrid_coefficients(
+                    T, a_T, TC=TC, **held, return_quality=True)
             result_data = {
                 'transform_method': 'hybrid',
                 'Tg': None, 'C1': C1_fit, 'C2': C2_fit,
