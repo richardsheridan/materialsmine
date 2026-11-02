@@ -14,6 +14,10 @@ from scipy.signal import find_peaks
 
 from .shift import hybrid_shift, UNIVERSAL_WLF_C1, UNIVERSAL_WLF_C2, wlf_log10_shift
 
+# Range a free Ea is optimized within, kJ/mol, bounds included.
+_EA_MIN = 100.0
+_EA_MAX = 400.0
+
 
 def _curve_fit_shift(model, T: np.ndarray, log10_a_T: np.ndarray,
                      p0: list, bounds=(-np.inf, np.inf),
@@ -319,6 +323,10 @@ def fit_hybrid_coefficients(
     constant by closing them over inside the model rather than passing them to
     curve_fit.
 
+    A free Ea is optimized within [100, 400] kJ/mol, bounds included, so a
+    result may sit on a bound; an initial guess outside the range is clipped
+    into it. A fixed Ea is not optimized and may hold any value.
+
     Parameters:
         T (numpy.ndarray): 1-D array of temperatures in °C, same length as a_T.
             Must be monotonically sorted (ascending or descending) as required by
@@ -372,6 +380,8 @@ def fit_hybrid_coefficients(
     C1_0 = C1 if C1 is not None else UNIVERSAL_WLF_C1
     C2_0 = C2 if C2 is not None else UNIVERSAL_WLF_C2
     Ea_0 = Ea if Ea is not None else _EA_DEFAULT
+    if not fix_Ea:
+        Ea_0 = float(np.clip(Ea_0, _EA_MIN, _EA_MAX))
 
     diffs = np.diff(T)
     if len(diffs) > 0:
@@ -418,8 +428,8 @@ def fit_hybrid_coefficients(
           if not fixed]
 
     # C2 floored at 1.0 to stay off the WLF pole.
-    lb = [1.0 if n == 'C2' else -np.inf for n in free_names]
-    ub = [np.inf] * len(free_names)
+    lb = [{'C2': 1.0, 'Ea': _EA_MIN}.get(n, -np.inf) for n in free_names]
+    ub = [_EA_MAX if n == 'Ea' else np.inf for n in free_names]
 
     def model(T_arg, *free_vals):
         vals = dict(zip(free_names, free_vals))
