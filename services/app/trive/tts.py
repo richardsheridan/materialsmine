@@ -59,7 +59,7 @@ def tts_temperature_to_frequency_V2(temp_sweep_data, shift_model, *,
             a frequency of 1.0 is assigned (a fixed-frequency DMA temperature
             sweep); like every frequency here it is taken as rad/s.
         shift_model (str): Which shift function to apply. 'WLF' uses
-            wlf_shift across all temperatures; 'hybrid' uses hybrid_shift
+            wlf_shift on the rows wlf_window keeps; 'hybrid' uses hybrid_shift
             (Arrhenius at or below TC, WLF above); 'manual' requires
             shiftData and uses it directly.
         Tg (float): WLF reference temperature (used when shift_model == 'WLF').

@@ -331,17 +331,8 @@
       <label for="prony" class="md-body-2">
         Relaxation Grid Size <span>[{{ dynamfit.range }}]</span>
         <HelpPopover label="Relaxation grid size">
-          How many relaxation times the fit may choose from, log-spaced across your data's
-          span. The default is about 3 per decade of frequency; a finer grid fits finer
-          detail but can overfit noisy data. This is an upper bound rather than the answer:
-          the fit discards terms it does not need, and temperature-domain data is capped
-          against the frequency span the ω-T transform produces. The figure legends report how
-          many terms the fit actually kept, and the coefficient table lists them. After a fit, the
-          slider's maximum drops to the number of distinct terms your data's span and precision
-          can carry; beyond it, extra terms only duplicate their neighbours and are filled in by
-          the smoothing, not the data. When the grid is coarser than your data can resolve at
-          the stated error and smoothness, the frequency plots show a note suggesting a larger
-          grid size; that suggestion is only as good as the error you entered.
+          How many log-spaced relaxation times the fit may choose from; the default is about
+          3 per decade. It is an upper bound: the fit keeps only the terms it needs.
         </HelpPopover>
       </label>
       <div class="nuplot-range-slider u--margin-centered u_centralize_text viz-u-postion__rel">

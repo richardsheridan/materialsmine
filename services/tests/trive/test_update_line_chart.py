@@ -734,9 +734,9 @@ class TestUpdateLineChartWlfPoleDrop(unittest.TestCase):
         self.assertEqual(self._experiment_count(result[0]), self.N_KEPT)
         self.assertGreater(len(result[6]), 0)
 
-    def test_drop_warning_names_counts_cutoff_pole_and_hybrid(self):
+    def test_drop_warning_names_counts_cutoff_and_pole(self):
         """One warning names the rows dropped of the total, the cutoff
-        temperature and the pole, and suggests the hybrid model."""
+        temperature and the pole."""
         warnings = self._main()[10]
         self.assertIsInstance(warnings, list)
         self.assertEqual(len(warnings), 1, warnings)
@@ -744,7 +744,6 @@ class TestUpdateLineChartWlfPoleDrop(unittest.TestCase):
         for value in (self.N_DROPPED, len(self.ROWS), self.COLD_EDGE,
                       self.POLE):
             self.assertTrue(names_number(text, value), (value, text))
-        self.assertIn('hybrid', text.lower())
 
     def test_temperature_and_shift_figures_mark_the_cutoff_temperature(self):
         """fig4, fig41 and the shift figure carry a line at the cold edge

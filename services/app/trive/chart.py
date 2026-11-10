@@ -171,7 +171,7 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # overwrite this pair on their transform paths.
     shift_fig, shift_records = go.Figure(), []
     # Set by a temperature-domain WLF transform that drops rows (_wlf_drop).
-    wlf_drop, warnings = None, []
+    wlf_drop = None
 
     if domain == "frequency":
         if np.any(df['Frequency'].to_numpy() <= 0):
@@ -275,11 +275,6 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
         )
         if shift_model == 'WLF' and not shiftData:
             wlf_drop = _wlf_drop(temp_sweep_data, Tg, C1, C2)
-        if wlf_drop:
-            for fig in (fig4, fig41, shift_fig):
-                _mark_cutoffs(fig, wlf_drop['temperatures'])
-            _stamp_notice((fig4, fig41, shift_fig), wlf_drop['notice'])
-            warnings.append(wlf_drop['warning'])
         df = freq_sweep_data.rename(
             columns={"E'": 'E Storage', "E''": 'E Loss'},
         )
@@ -358,13 +353,17 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     fig2, fig3 = _build_relaxation_figures(
         tau_i, E_i, N_nz, fit_settings, fit_quality.covariance)
     coef_records = _build_coef_records(tau_i, E_i, fit_quality.covariance)
+    warnings = []
     if wlf_drop:
         omegas = wlf_drop['frequencies']
-        for fig in (fig1, fig11):
-            _mark_cutoffs(fig, omegas)
-        for fig in (fig2, fig3):
-            _mark_cutoffs(fig, [1.0 / w for w in omegas])
-        _stamp_notice((fig1, fig11, fig2, fig3), wlf_drop['notice'])
+        for figs, xs in (((fig4, fig41, shift_fig), wlf_drop['temperatures']),
+                         ((fig1, fig11), omegas),
+                         ((fig2, fig3), [1.0 / w for w in omegas])):
+            for fig in figs:
+                _mark_cutoffs(fig, xs)
+        _stamp_notice((fig1, fig11, fig2, fig3, fig4, fig41, shift_fig),
+                      wlf_drop['notice'])
+        warnings.append(wlf_drop['warning'])
 
     return (fig1, fig11, fig2, fig3, fig4, fig41, coef_records,
             shift_fig, shift_records, max_prony, warnings)
@@ -405,9 +404,8 @@ def _wlf_drop(temp_sweep_data, Tg, C1, C2):
     return {
         'warning': (
             f"WLF shift: dropped {n_dropped} of {len(T)} rows {cut}, where "
-            f"|log10 a_T| passes {bound:g} or the row is at or below the WLF "
-            f"pole at {Tg - C2:.1f} °C (Tg − C2). The fit uses the remaining "
-            "rows; the hybrid model avoids the pole."
+            f"|log10 a_T| > {bound:g} or the row is at or below the WLF "
+            f"pole at {Tg - C2:.1f} °C (Tg − C2)."
         ),
         'notice': (f"{n_dropped} of {len(T)} rows dropped {cut} "
                    "(outside the WLF shift window)"),

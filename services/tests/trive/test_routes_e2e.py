@@ -808,14 +808,13 @@ class TestExtractRouteWlfPoleDrop(unittest.TestCase):
 
     def test_ramp_through_the_pole_fits_and_warns(self):
         """A 200 whose warnings carry one entry naming 68 of 122 rows, the
-        cutoff, the pole Tg - C2 and the hybrid model."""
+        cutoff and the pole Tg - C2."""
         warnings = self._response()['warnings']
         self.assertEqual(len(warnings), 1, warnings)
         text = warnings[0]
         for value in (self.N_DROPPED, self.N_ROWS, self.COLD_EDGE,
                       self.TG - self.C2):
             self.assertTrue(names_number(text, value), (value, text))
-        self.assertIn('hybrid', text.lower())
 
     def test_every_chart_marks_the_cutoff_on_every_facet(self):
         """Temperature and shift charts at the cold edge, frequency charts
@@ -1077,7 +1076,6 @@ class TestExtractRouteEstimateWarnings(unittest.TestCase):
         self.assertTrue(warnings[0].startswith('Estimated Tg'), warnings)
         self.assertTrue(names_number(warnings[1], 28), warnings)
         self.assertTrue(names_number(warnings[1], 41), warnings)
-        self.assertIn('hybrid', warnings[1].lower())
 
     def test_both_estimates_near_edge_warn_twice(self):
         # Peak at 78 °C — within 5° of the hot edge; Tg and TC both estimate
