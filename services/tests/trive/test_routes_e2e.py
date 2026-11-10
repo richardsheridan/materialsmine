@@ -47,6 +47,7 @@ from app.config import Config
 from app.utils.util import upload_init
 
 from ._route_helpers import make_app, make_token, REAL_FILES_DIR
+from ._figure_lines import facet_axes, names_number, vertical_lines
 from ._tc_scan import assert_search_properties
 
 
@@ -764,6 +765,81 @@ class TestExtractRoute(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class TestExtractRouteWlfPoleDrop(unittest.TestCase):
+    """
+    E2E: the bundled VeroCyan ramp at Tg 78.22 with universal WLF constants
+    puts its pole (26.62 C) inside the data. The extract drops the rows past
+    the cold edge (54.36 C), fits the rest, warns, and marks the cutoff.
+    """
+
+    _orig_files_dir = None
+    FILE = 'VeroCyan (5) Temperature Ramp clean.txt'
+    TG, C1, C2 = 78.22, 17.44, 51.6
+    COLD_EDGE = TG - 15.0 * C2 / (C1 + 15.0)
+    N_ROWS = 122
+    N_DROPPED = 68
+
+    @classmethod
+    def setUpClass(cls):
+        cls._orig_files_dir = Config.FILES_DIRECTORY
+        Config.FILES_DIRECTORY = REAL_FILES_DIR
+        Config.SECRET_KEY = 'test-secret'
+        client = make_app().test_client()
+        headers = {
+            'Authorization': f'Bearer {make_token()}',
+            'Content-Type': 'application/json',
+        }
+        body = {
+            'file_name': cls.FILE, 'domain': 'temperature',
+            'number_of_prony': 20, 'smoothness': 0.1,
+            'transform_method': 'WLF',
+            'Tg': cls.TG, 'C1': cls.C1, 'C2': cls.C2,
+        }
+        cls.resp = client.post('/tri-ve/extract/', data=json.dumps(body),
+                               headers=headers)
+
+    @classmethod
+    def tearDownClass(cls):
+        Config.FILES_DIRECTORY = cls._orig_files_dir
+
+    def _response(self):
+        self.assertEqual(self.resp.status_code, 200, self.resp.data[:400])
+        return json.loads(self.resp.data)['response']
+
+    def test_ramp_through_the_pole_fits_and_warns(self):
+        """A 200 whose warnings carry one entry naming 68 of 122 rows, the
+        cutoff, the pole Tg - C2 and the hybrid model."""
+        warnings = self._response()['warnings']
+        self.assertEqual(len(warnings), 1, warnings)
+        text = warnings[0]
+        for value in (self.N_DROPPED, self.N_ROWS, self.COLD_EDGE,
+                      self.TG - self.C2):
+            self.assertTrue(names_number(text, value), (value, text))
+        self.assertIn('hybrid', text.lower())
+
+    def test_every_chart_marks_the_cutoff_on_every_facet(self):
+        """Temperature and shift charts at the cold edge, frequency charts
+        at 1e15 rad/s, relaxation charts at 1e-15 s."""
+        response = self._response()
+        expected = {
+            'complex-temp-chart': (self.COLD_EDGE, dict(rtol=0, atol=1e-6)),
+            'temp-tand-chart': (self.COLD_EDGE, dict(rtol=0, atol=1e-6)),
+            'shift-chart': (self.COLD_EDGE, dict(rtol=0, atol=1e-6)),
+            'complex-chart': (1e15, dict(rtol=1e-6)),
+            'complex-tand-chart': (1e15, dict(rtol=1e-6)),
+            'relaxation-chart': (1e-15, dict(rtol=1e-6)),
+            'relaxation-spectrum-chart': (1e-15, dict(rtol=1e-6)),
+        }
+        for key, (x, tol) in expected.items():
+            fig = response[key]
+            lines = vertical_lines(fig)
+            for axis in sorted(facet_axes(fig)):
+                with self.subTest(chart=key, axis=axis):
+                    got = [v for a, v in lines if a == axis]
+                    self.assertEqual(len(got), 1, lines)
+                    np.testing.assert_allclose(got, [x], **tol)
+
+
 class TestExtractRouteErrorColumns(unittest.TestCase):
     """
     Route-level coverage for the optional error columns.
@@ -986,6 +1062,22 @@ class TestExtractRouteEstimateWarnings(unittest.TestCase):
         warnings = json.loads(resp.data)['response']['warnings']
         self.assertEqual(len(warnings), 1)
         self.assertIn('Tg', warnings[0])
+
+    def test_edge_estimate_warning_precedes_the_wlf_drop_warning(self):
+        # Peak at 78 C: the estimated Tg warns, and with universal C1/C2 the
+        # cold edge sits at 54.1 C, so rows 0..54 (28 of 41) are dropped.
+        name = self._write_ramp('hot_edge_wlf.tsv', 78)
+        resp = self._post(self._temp_body(
+            name, transform_method='WLF',
+            Tg_estimate=True, C1_estimate=True, C2_estimate=True,
+        ))
+        self.assertEqual(resp.status_code, 200, resp.data[:400])
+        warnings = json.loads(resp.data)['response']['warnings']
+        self.assertEqual(len(warnings), 2, warnings)
+        self.assertTrue(warnings[0].startswith('Estimated Tg'), warnings)
+        self.assertTrue(names_number(warnings[1], 28), warnings)
+        self.assertTrue(names_number(warnings[1], 41), warnings)
+        self.assertIn('hybrid', warnings[1].lower())
 
     def test_both_estimates_near_edge_warn_twice(self):
         # Peak at 78 °C — within 5° of the hot edge; Tg and TC both estimate
