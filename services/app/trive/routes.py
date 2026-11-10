@@ -286,7 +286,7 @@ def extract_data_from_file(request_id):
                 "Tg": Tg,
                 "Ea": Ea,
                 "TC": TC,
-                "warnings": estimate_warnings,
+                "warnings": estimate_warnings + result[10],
             }
         }
         end_time = datetime.datetime.now()

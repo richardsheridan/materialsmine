@@ -17,7 +17,8 @@ from app.utils.util import log_errors
 from .prony import prony_terms_for_span
 from .fit import smooth_prony_fit
 from .reduction import prony_rank_limit, prony_resolution
-from .tts import tts_frequency_to_temperature_V2, tts_temperature_to_frequency_V2
+from .tts import (MAX_ABS_LOG10_SHIFT, tts_frequency_to_temperature_V2,
+                  tts_temperature_to_frequency_V2, wlf_window)
 from .figures import (
     _annotate_decimation,
     _annotate_fit_quality,
@@ -28,6 +29,7 @@ from .figures import (
     _build_shift_figure,
     _build_temperature_figures,
     _decimate_for_plot,
+    _mark_cutoffs,
     _stamp_notice,
 )
 
@@ -121,6 +123,9 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
         shift_records (list): The table behind fig5; [] when fig5 is empty.
         max_prony (int or None): reduction.prony_rank_limit on the master
             curve the fit consumed; None on the temperature preview.
+        warnings (list of str): Notices for the user from the transform;
+            empty unless a temperature-domain WLF transform dropped rows,
+            in which case every figure also marks each cutoff (_wlf_drop).
 
     Raises:
         ValueError: If the uploaded data is empty, contains non-finite values,
@@ -165,6 +170,8 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     # The shift figure only exists when a transform is in play; both branches
     # overwrite this pair on their transform paths.
     shift_fig, shift_records = go.Figure(), []
+    # Set by a temperature-domain WLF transform that drops rows (_wlf_drop).
+    wlf_drop, warnings = None, []
 
     if domain == "frequency":
         if np.any(df['Frequency'].to_numpy() <= 0):
@@ -242,7 +249,7 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
             return (
                 empty, empty, empty, empty, fig4, fig41,
                 pd.DataFrame(columns=["tau_i", "E_i"]).to_dict("records"),
-                shift_fig, shift_records, None,
+                shift_fig, shift_records, None, [],
             )
 
         freq_sweep_data = tts_temperature_to_frequency_V2(
@@ -266,6 +273,13 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
             (float(T_upload.min()), float(T_upload.max())),
             shift_chi2_reduced,
         )
+        if shift_model == 'WLF' and not shiftData:
+            wlf_drop = _wlf_drop(temp_sweep_data, Tg, C1, C2)
+        if wlf_drop:
+            for fig in (fig4, fig41, shift_fig):
+                _mark_cutoffs(fig, wlf_drop['temperatures'])
+            _stamp_notice((fig4, fig41, shift_fig), wlf_drop['notice'])
+            warnings.append(wlf_drop['warning'])
         df = freq_sweep_data.rename(
             columns={"E'": 'E Storage', "E''": 'E Loss'},
         )
@@ -344,6 +358,59 @@ def update_line_chart(uploadData, number_of_prony, smoothness, fit_settings, dom
     fig2, fig3 = _build_relaxation_figures(
         tau_i, E_i, N_nz, fit_settings, fit_quality.covariance)
     coef_records = _build_coef_records(tau_i, E_i, fit_quality.covariance)
+    if wlf_drop:
+        omegas = wlf_drop['frequencies']
+        for fig in (fig1, fig11):
+            _mark_cutoffs(fig, omegas)
+        for fig in (fig2, fig3):
+            _mark_cutoffs(fig, [1.0 / w for w in omegas])
+        _stamp_notice((fig1, fig11, fig2, fig3), wlf_drop['notice'])
 
     return (fig1, fig11, fig2, fig3, fig4, fig41, coef_records,
-            shift_fig, shift_records, max_prony)
+            shift_fig, shift_records, max_prony, warnings)
+
+
+def _wlf_drop(temp_sweep_data, Tg, C1, C2):
+    """
+    What a temperature-domain WLF transform dropped, or None if nothing.
+
+    Returns a dict with the user-facing 'warning', the figure 'notice', and
+    the cutoff of each window edge rows were dropped past: 'temperatures'
+    for the temperature axes and 'frequencies' for the master curve. An
+    edge's frequency is 10**(+-MAX_ABS_LOG10_SHIFT) times the source
+    frequency of the kept row nearest it (1.0 without a Frequency column).
+    """
+    df = temp_sweep_data.sort_values('Temperature')
+    T = df['Temperature'].to_numpy()
+    keep = wlf_window(T, Tg, C1, C2)
+    n_dropped = int(np.count_nonzero(~keep))
+    if n_dropped == 0 or not np.any(keep):
+        return None
+    omega = (df['Frequency'].to_numpy() if 'Frequency' in df.columns
+             else np.ones(len(T)))
+    kept = np.flatnonzero(keep)
+    bound = MAX_ABS_LOG10_SHIFT
+    temperatures, frequencies, phrases = [], [], []
+    if np.any(~keep & (T < Tg)):
+        cold = Tg - bound * C2 / (C1 + bound)
+        temperatures.append(cold)
+        frequencies.append(10.0 ** bound * omega[kept[0]])
+        phrases.append(f"below {cold:.1f} °C")
+    if np.any(~keep & (T > Tg)):
+        hot = Tg + bound * C2 / (C1 - bound)
+        temperatures.append(hot)
+        frequencies.append(10.0 ** -bound * omega[kept[-1]])
+        phrases.append(f"above {hot:.1f} °C")
+    cut = ' and '.join(phrases)
+    return {
+        'warning': (
+            f"WLF shift: dropped {n_dropped} of {len(T)} rows {cut}, where "
+            f"|log10 a_T| passes {bound:g} or the row is at or below the WLF "
+            f"pole at {Tg - C2:.1f} °C (Tg − C2). The fit uses the remaining "
+            "rows; the hybrid model avoids the pole."
+        ),
+        'notice': (f"{n_dropped} of {len(T)} rows dropped {cut} "
+                   "(outside the WLF shift window)"),
+        'temperatures': temperatures,
+        'frequencies': frequencies,
+    }

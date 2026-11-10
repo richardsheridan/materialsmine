@@ -74,6 +74,26 @@ def _decimate_for_plot(df: pd.DataFrame) -> tuple:
     return df.iloc[idx], percent
 
 
+def _mark_cutoffs(fig, xs) -> None:
+    """
+    Draw a dashed vertical line at each x on every facet of fig.
+
+    The lines are layout shapes, not traces, so the trace list stays as the
+    figure builder left it. Each facet's x axis gets one line per position,
+    spanning that facet's own y domain.
+    """
+    facets = {}
+    for t in fig.data:
+        facets.setdefault(t.xaxis or 'x', t.yaxis or 'y')
+    for xref, yref in sorted(facets.items()):
+        for x in xs:
+            fig.add_shape(
+                type='line', xref=xref, yref=f'{yref} domain',
+                x0=x, x1=x, y0=0, y1=1,
+                line=dict(color='gray', dash='dash', width=1),
+            )
+
+
 def _stamp_notice(figs, text: str) -> None:
     """
     Caption each figure above the plot area, on the next free row.

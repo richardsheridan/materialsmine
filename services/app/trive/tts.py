@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 
-from .shift import hybrid_shift, inverse_hybrid_shift, inverse_wlf_shift, wlf_shift
+from .shift import (hybrid_shift, inverse_hybrid_shift, inverse_wlf_shift,
+                    wlf_log10_shift, wlf_shift)
 
 
 # Drop master-curve rows whose |log10(a_T)| exceeds this; near the WLF
@@ -24,6 +25,18 @@ MAX_ABS_LOG10_SHIFT = 15.0
 # comparable across uploads. In the upload's own frequency units, which are
 # not inspected and are taken as rad/s.
 VIS_REF_FREQUENCY = 1.0
+
+
+def wlf_window(T, T_ref, C1, C2):
+    """
+    The rows a WLF transform keeps: those above the pole T_ref - C2 whose
+    |log10 a_T| is at most MAX_ABS_LOG10_SHIFT. Never raises, so the rows
+    near the pole can be dropped instead of failing the whole upload.
+    """
+    T = np.asarray(T, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        log_a_T = wlf_log10_shift(T, T_ref, C1, C2)
+        return (T > T_ref - C2) & (np.abs(log_a_T) <= MAX_ABS_LOG10_SHIFT)
 
 
 def tts_temperature_to_frequency_V2(temp_sweep_data, shift_model, *,
@@ -72,7 +85,8 @@ def tts_temperature_to_frequency_V2(temp_sweep_data, shift_model, *,
         ['Frequency', 'Temperature', "E'", "E''"], sorted by Frequency with a
         fresh 0..N-1 index. Input temp_sweep_data is not mutated. Rows whose
         |log10(a_T)| exceeds MAX_ABS_LOG10_SHIFT are dropped (WLF-singularity
-        guard), so the result may be shorter than the input.
+        guard), and under WLF so is every row at or below the pole
+        Tg - C2 (see wlf_window), so the result may be shorter than the input.
 
     Raises:
         ValueError: If shift_model is 'manual' without shiftData, or if no rows
@@ -107,7 +121,11 @@ def tts_temperature_to_frequency_V2(temp_sweep_data, shift_model, *,
                     "or match the row counts."
                 )
     elif shift_model == 'WLF':
-        a_T = wlf_shift(T, Tg, C1, C2)
+        # Rows outside wlf_window get an infinite a_T, which the window check
+        # below drops along with any other out-of-window row.
+        in_window = wlf_window(T, Tg, C1, C2)
+        a_T = np.full(len(T), np.inf)
+        a_T[in_window] = wlf_shift(T[in_window], Tg, C1, C2)
     elif shift_model == 'hybrid':
         a_T = hybrid_shift(T, TC, C1, C2, Ea)
     elif shift_model == 'manual':
