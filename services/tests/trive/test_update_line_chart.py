@@ -229,7 +229,7 @@ class TestUpdateLineChartFrequencyShift(unittest.TestCase):
     def test_frequency_manual_uses_shiftData(self):
         manual = self._run(shift_model='manual', shiftData=self.shiftData)
         wlf = self._run(shift_model='WLF', Tg=30.0, C1=17.44, C2=51.6)
-        self.assertEqual(len(manual), 10)
+        self.assertEqual(len(manual), 11)
         # The manual mapping reached fig4: its temperature axis differs from a
         # WLF evaluation (a different shape alone already proves it, since
         # np.interp clamps).
@@ -2226,7 +2226,7 @@ class TestUpdateLineChartValidation(unittest.TestCase):
         ok = self._freq([1.0, 2.0, 3.0], [100.0, 200.0, 300.0], [10.0, 20.0, 30.0])
         ok['E Storage Error'] = np.asarray([5.0, 10.0, 15.0], float)
         ok['E Loss Error'] = np.asarray([0.5, 1.0, 1.5], float)
-        self.assertEqual(len(self._call(ok, domain='frequency')), 10)
+        self.assertEqual(len(self._call(ok, domain='frequency')), 11)
 
     def test_temperature_domain_zero_error_raises_value_error(self):
         # WLF params chosen as in TestUpdateLineChartErrorColumns so every row
